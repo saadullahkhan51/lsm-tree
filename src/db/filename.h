@@ -10,9 +10,11 @@ namespace lsm {
 // Files in a database directory:
 //   LOCK          held for as long as the database is open
 //   NNNNNN.log    write-ahead log
-enum class FileType { kLogFile, kLockFile };
+//   NNNNNN.sst    sorted table
+enum class FileType { kLogFile, kLockFile, kTableFile };
 
 std::string LogFileName(const std::string& dbname, uint64_t number);
+std::string TableFileName(const std::string& dbname, uint64_t number);
 std::string LockFileName(const std::string& dbname);
 
 // Recognizes a name (without directory) the engine created. *number is 0
