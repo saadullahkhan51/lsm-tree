@@ -37,7 +37,9 @@ class CrashTest : public testing::Test {
     std::string value;
     Status s = db_->Get(ReadOptions(), Key(i), &value);
     EXPECT_TRUE(s.ok() || s.IsNotFound()) << s.ToString();
-    if (s.ok()) EXPECT_EQ(Value(i), value) << "key " << i;
+    if (s.ok()) {
+      EXPECT_EQ(Value(i), value) << "key " << i;
+    }
     return s.ok();
   }
 

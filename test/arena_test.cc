@@ -30,7 +30,9 @@ TEST(Arena, AllocationsAreDisjointAndStable) {
 
     const bool aligned = rnd() % 10 == 0;
     char* r = aligned ? arena.AllocateAligned(s) : arena.Allocate(s);
-    if (aligned) ASSERT_EQ(0u, reinterpret_cast<uintptr_t>(r) % 8);
+    if (aligned) {
+      ASSERT_EQ(0u, reinterpret_cast<uintptr_t>(r) % 8);
+    }
 
     // Fill with a pattern derived from the allocation's index; overlapping
     // allocations would corrupt each other's pattern.
@@ -38,7 +40,9 @@ TEST(Arena, AllocationsAreDisjointAndStable) {
     bytes += s;
     allocated.emplace_back(s, r);
     ASSERT_GE(arena.MemoryUsage(), bytes);
-    if (i > 100000 / 10) ASSERT_LE(arena.MemoryUsage(), bytes * 1.10);
+    if (i > 100000 / 10) {
+      ASSERT_LE(arena.MemoryUsage(), bytes * 1.10);
+    }
   }
   for (size_t i = 0; i < allocated.size(); i++) {
     const auto [size, p] = allocated[i];

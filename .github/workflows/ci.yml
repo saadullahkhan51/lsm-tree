@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Nightly: the long crash loop with a fresh seed, and the long stress run.
+    - cron: "0 3 * * *"
+
+jobs:
+  test:
+    name: ${{ matrix.compiler }} / ${{ matrix.preset }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        # asan is ASan and UBSan together.
+        preset: [debug, release, asan, tsan]
+    env:
+      CXX: ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Lower ASLR entropy
+        # The sanitizer runtimes shipped with this image cannot map their
+        # shadow memory under the kernel's default of 32 bits.
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }} -j 4 --timeout 1200
+        env:
+          # The memtable reader/writer stress runs its full 30 seconds under
+          # TSan, which is where it matters.
+          LSM_STRESS_SECONDS: ${{ matrix.preset == 'tsan' && '30' || '2' }}
+          # A fixed seed set: the same 1000 crash cycles on every push.
+          LSM_CRASH_CYCLES: "1000"
+          LSM_CRASH_SEED: "1"
+
+  fuzz:
+    name: fuzz smoke
+    runs-on: ubuntu-24.04
+    env:
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Lower ASLR entropy
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Build fuzzers
+        run: cmake --preset fuzz && cmake --build --preset fuzz
+      - name: Run each fuzzer for 60 seconds
+        run: |
+          for target in block log_reader version_edit table write_batch; do
+            mkdir -p corpus/$target
+            ./build/fuzz/${target}_fuzzer -max_total_time=60 -max_len=4096 corpus/$target
+          done
+      - name: Keep crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            oom-*
+            timeout-*
+
+  nightly:
+    name: nightly crash loop and stress
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    env:
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Lower ASLR entropy
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Build
+        run: |
+          cmake --preset debug && cmake --build --preset debug
+          cmake --preset tsan && cmake --build --preset tsan
+      - name: Crash loop, 50,000 cycles, random seed
+        # The seed is the run id: different every night, and printed, so a
+        # failure can be rerun.
+        run: ./build/debug/lsm_tests --gtest_filter='CrashLoop.*'
+        env:
+          LSM_CRASH_CYCLES: "50000"
+          LSM_CRASH_SEED: ${{ github.run_id }}
+      - name: Bit flips, 400 per file
+        run: ./build/debug/lsm_tests --gtest_filter='BitFlip.*'
+        env:
+          LSM_BITFLIP_PER_FILE: "400"
+          LSM_BITFLIP_SEED: ${{ github.run_id }}
+      - name: Stress, 16 threads for 10 minutes under TSan
+        run: ./build/tsan/lsm_tests --gtest_filter='Stress.*'
+        env:
+          LSM_DB_STRESS_SECONDS: "600"
