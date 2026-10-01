@@ -1,0 +1,1 @@
+- when implementing plans, each feature must go into its own feature branch built on top of the current working branch
