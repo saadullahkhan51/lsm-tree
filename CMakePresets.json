@@ -10,34 +10,94 @@
     {
       "name": "debug",
       "inherits": "base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
     },
     {
       "name": "release",
       "inherits": "base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     },
     {
       "name": "asan",
       "inherits": "base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "LSM_SANITIZE": "address,undefined" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LSM_SANITIZE": "address,undefined"
+      }
     },
     {
       "name": "tsan",
       "inherits": "base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "LSM_SANITIZE": "thread" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LSM_SANITIZE": "thread"
+      }
+    },
+    {
+      "name": "fuzz",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LSM_SANITIZE": "address,undefined",
+        "LSM_BUILD_FUZZERS": "ON",
+        "LSM_BUILD_TESTS": "OFF"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "debug", "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" },
-    { "name": "asan", "configurePreset": "asan" },
-    { "name": "tsan", "configurePreset": "tsan" }
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan"
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan"
+    },
+    {
+      "name": "fuzz",
+      "configurePreset": "fuzz"
+    }
   ],
   "testPresets": [
-    { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
-    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
-    { "name": "asan", "configurePreset": "asan", "output": { "outputOnFailure": true } },
-    { "name": "tsan", "configurePreset": "tsan", "output": { "outputOnFailure": true } }
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
   ]
 }
