@@ -94,6 +94,20 @@ void SaveValue(void* arg, Slice ikey, Slice v) {
 
 }  // namespace
 
+void Version::AddIterators(const ReadOptions& options, std::vector<Iterator*>* iters) const {
+  // Level-0 files overlap, so each is a separate input to the merge.
+  for (const FileMetaData* f : files_[0]) {
+    iters->push_back(vset_->table_cache_->NewIterator(options, f->number, f->file_size));
+  }
+  // A deeper level is one sorted run: its files are opened lazily, one at
+  // a time, as the iterator reaches them.
+  for (int level = 1; level < config::kNumLevels; level++) {
+    if (!files_[level].empty()) {
+      iters->push_back(vset_->NewConcatenatingIterator(options, &files_[level]));
+    }
+  }
+}
+
 Status Version::Get(const ReadOptions& options, const LookupKey& key, std::string* value,
                     GetStats* stats) const {
   const Slice ikey = key.internal_key();

@@ -2,12 +2,21 @@
 
 #include <string>
 
+#include "lsm/iterator.h"
 #include "lsm/options.h"
 #include "lsm/slice.h"
 #include "lsm/status.h"
 #include "lsm/write_batch.h"
 
 namespace lsm {
+
+// A handle to the state of the database at one moment. Obtained from
+// DB::GetSnapshot and passed in ReadOptions; immutable and safe to share
+// between threads.
+class Snapshot {
+ protected:
+  virtual ~Snapshot() = default;
+};
 
 // A persistent ordered map from keys to values. Safe for concurrent use
 // from multiple threads without external synchronization.
@@ -36,6 +45,21 @@ class DB {
   // Stores the value for key in *value. Returns a status for which
   // IsNotFound() is true if there is none.
   virtual Status Get(const ReadOptions& options, const Slice& key, std::string* value) = 0;
+
+  // Returns an iterator over the contents of the database as of now, or as
+  // of options.snapshot. It starts out invalid: call one of its Seek
+  // methods first. The caller deletes it, before deleting the database.
+  // Writes and compactions that happen while it is live do not affect what
+  // it sees.
+  virtual Iterator* NewIterator(const ReadOptions& options) = 0;
+
+  // Pins the current state. Reads given this snapshot see exactly what was
+  // there when it was taken, whatever is written, deleted, or compacted
+  // afterwards. The data it needs is kept until ReleaseSnapshot.
+  virtual const Snapshot* GetSnapshot() = 0;
+
+  // The snapshot must not be used afterwards.
+  virtual void ReleaseSnapshot(const Snapshot* snapshot) = 0;
 
   // Reports an aspect of the database's state. Returns false if the
   // property is not recognized. Properties:

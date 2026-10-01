@@ -44,6 +44,11 @@ class Version {
   Status Get(const ReadOptions& options, const LookupKey& key, std::string* value,
              GetStats* stats) const;
 
+  // Appends to *iters iterators that together yield every entry in this
+  // version when merged: one per level-0 file, one per deeper level. The
+  // version must stay referenced while they are live.
+  void AddIterators(const ReadOptions& options, std::vector<Iterator*>* iters) const;
+
   void Ref();
   void Unref();
 

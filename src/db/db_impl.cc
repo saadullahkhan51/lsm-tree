@@ -9,10 +9,12 @@
 
 #include "db/builder.h"
 #include "db/compaction_check.h"
+#include "db/db_iter.h"
 #include "db/filename.h"
 #include "db/log_reader.h"
 #include "db/memtable.h"
 #include "db/write_batch_internal.h"
+#include "table/merger.h"
 #include "table/table_builder.h"
 
 namespace lsm {
@@ -341,7 +343,12 @@ void DBImpl::BackgroundThread() {
   }
 }
 
-SequenceNumber DBImpl::SmallestSnapshot() const { return versions_.LastSequence(); }
+SequenceNumber DBImpl::SmallestSnapshot() const {
+  // With no snapshots, only the latest state can be read through the
+  // current version. (A read in progress has pinned the version it started
+  // with and is unaffected by what a compaction installs.)
+  return snapshots_.empty() ? versions_.LastSequence() : snapshots_.oldest()->sequence();
+}
 
 void DBImpl::BackgroundCompaction(Lock* lock) {
   if (imm_ != nullptr) {
@@ -468,7 +475,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact, Lock* lock) {
   assert(compact->builder == nullptr);
 
   compact->smallest_snapshot = SmallestSnapshot();
-  compact->read_points = {kMaxSequenceNumber};
+  snapshots_.ForEach([&](SequenceNumber s) { compact->read_points.push_back(s); });
+  compact->read_points.push_back(kMaxSequenceNumber);
 
   std::unique_ptr<Iterator> input(versions_.MakeInputIterator(c));
   const Comparator* ucmp = internal_comparator_.user_comparator();
@@ -693,7 +701,10 @@ void DBImpl::RemoveObsoleteFiles(Lock* lock) {
 
 Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* value) {
   Lock lock(mutex_);
-  const SequenceNumber snapshot = versions_.LastSequence();
+  const SequenceNumber snapshot =
+      options.snapshot != nullptr
+          ? static_cast<const SnapshotImpl*>(options.snapshot)->sequence()
+          : versions_.LastSequence();
   MemTable* mem = mem_;
   MemTable* imm = imm_;
   Version* current = versions_.current();
@@ -721,6 +732,74 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
   if (imm != nullptr) imm->Unref();
   current->Unref();
   return s;
+}
+
+namespace {
+
+// What an internal iterator keeps alive.
+struct IterState {
+  std::mutex* const mu;
+  Version* const version;
+  MemTable* const mem;
+  MemTable* const imm;
+};
+
+void CleanupIteratorState(void* arg1, void*) {
+  auto* state = static_cast<IterState*>(arg1);
+  {
+    std::lock_guard lock(*state->mu);
+    state->mem->Unref();
+    if (state->imm != nullptr) state->imm->Unref();
+    state->version->Unref();
+  }
+  delete state;
+}
+
+}  // namespace
+
+Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
+                                      SequenceNumber* latest_sequence) {
+  Lock lock(mutex_);
+  *latest_sequence = versions_.LastSequence();
+
+  std::vector<Iterator*> children;
+  children.push_back(mem_->NewIterator());
+  mem_->Ref();
+  if (imm_ != nullptr) {
+    children.push_back(imm_->NewIterator());
+    imm_->Ref();
+  }
+  Version* current = versions_.current();
+  current->AddIterators(options, &children);
+  current->Ref();
+
+  Iterator* internal_iter = NewMergingIterator(&internal_comparator_, std::move(children));
+  // The memtables and the version (and through it, its files) stay alive
+  // for as long as the iterator does, whatever is flushed or compacted
+  // meanwhile.
+  internal_iter->RegisterCleanup(CleanupIteratorState,
+                                 new IterState{&mutex_, current, mem_, imm_}, nullptr);
+  return internal_iter;
+}
+
+Iterator* DBImpl::NewIterator(const ReadOptions& options) {
+  SequenceNumber latest_sequence;
+  Iterator* internal_iter = NewInternalIterator(options, &latest_sequence);
+  const SequenceNumber sequence =
+      options.snapshot != nullptr
+          ? static_cast<const SnapshotImpl*>(options.snapshot)->sequence()
+          : latest_sequence;
+  return NewDBIterator(internal_comparator_.user_comparator(), internal_iter, sequence);
+}
+
+const Snapshot* DBImpl::GetSnapshot() {
+  Lock lock(mutex_);
+  return snapshots_.New(versions_.LastSequence());
+}
+
+void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
+  Lock lock(mutex_);
+  snapshots_.Delete(static_cast<const SnapshotImpl*>(snapshot));
 }
 
 // --------------------------------------------------------------- Writes

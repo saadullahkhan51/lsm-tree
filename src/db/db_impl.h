@@ -11,6 +11,7 @@
 
 #include "db/dbformat.h"
 #include "db/log_writer.h"
+#include "db/snapshot.h"
 #include "db/table_cache.h"
 #include "db/version_set.h"
 #include "lsm/db.h"
@@ -29,6 +30,9 @@ class DBImpl : public DB {
 
   Status Write(const WriteOptions& options, WriteBatch* updates) override;
   Status Get(const ReadOptions& options, const Slice& key, std::string* value) override;
+  Iterator* NewIterator(const ReadOptions& options) override;
+  const Snapshot* GetSnapshot() override;
+  void ReleaseSnapshot(const Snapshot* snapshot) override;
   bool GetProperty(const Slice& property, std::string* value) override;
   Status CompactRange(const Slice* begin, const Slice* end) override;
 
@@ -99,8 +103,12 @@ class DBImpl : public DB {
   // Debug builds: checks the outputs against the inputs before installing.
   Status CheckCompaction(CompactionState* compact);
   void CleanupCompaction(CompactionState* compact);
-  // Oldest sequence number any reader may still read at.
+  // Oldest sequence number any snapshot may still read at.
   SequenceNumber SmallestSnapshot() const;
+  // An iterator over every entry in the memtables and the current version,
+  // as internal keys. Pins all three until it is deleted. Sets
+  // *latest_sequence to the newest sequence visible when it was created.
+  Iterator* NewInternalIterator(const ReadOptions& options, SequenceNumber* latest_sequence);
   // Deletes every file the current state no longer needs.
   void RemoveObsoleteFiles(Lock* lock);
   void RecordBackgroundError(const Status& s);
@@ -134,6 +142,8 @@ class DBImpl : public DB {
 
   std::deque<Writer*> writers_;
   WriteBatch tmp_batch_;  // scratch for BuildBatchGroup
+
+  SnapshotList snapshots_;
 
   // Table files being written that no version refers to yet. Protects them
   // from RemoveObsoleteFiles.

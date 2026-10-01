@@ -87,6 +87,41 @@ class DBTest : public testing::Test {
   // Compacts the whole of one level into the next.
   void CompactLevel(int level) { ASSERT_OK(impl()->TEST_CompactRange(level, nullptr, nullptr)); }
 
+  // Every entry an iterator yields, front to back: "(k1->v1)(k2->v2)".
+  std::string Contents(const ReadOptions& read_options = ReadOptions()) {
+    std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
+    std::string forward;
+    std::vector<std::string> entries;
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      entries.push_back("(" + std::string(iter->key()) + "->" + std::string(iter->value()) + ")");
+      forward += entries.back();
+    }
+    EXPECT_OK(iter->status());
+
+    // The reverse scan must yield the same entries in the opposite order.
+    size_t matched = 0;
+    for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+      const std::string entry =
+          "(" + std::string(iter->key()) + "->" + std::string(iter->value()) + ")";
+      if (matched < entries.size()) {
+        EXPECT_EQ(entries[entries.size() - 1 - matched], entry);
+      }
+      matched++;
+    }
+    EXPECT_EQ(entries.size(), matched);
+    EXPECT_OK(iter->status());
+    return forward;
+  }
+
+  std::string GetAt(const Snapshot* snapshot, const std::string& key) {
+    ReadOptions read_options;
+    read_options.snapshot = snapshot;
+    std::string value;
+    Status s = db_->Get(read_options, key, &value);
+    if (s.IsNotFound()) return "NOT_FOUND";
+    return s.ok() ? value : s.ToString();
+  }
+
   std::string Property(const std::string& name) {
     std::string value;
     return db_->GetProperty(name, &value) ? value : "(unknown property)";
@@ -834,6 +869,219 @@ TEST_F(DBTest, WritersStallWhenTheBackgroundThreadFallsBehind) {
   for (int i = 0; i < 50; i++) ASSERT_EQ(value, Get("key" + std::to_string(i)));
 }
 
+// --- Iterators and snapshots ---
+
+TEST_F(DBTest, IterateEmpty) {
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  ASSERT_FALSE(iter->Valid());
+  iter->SeekToFirst();
+  ASSERT_FALSE(iter->Valid());
+  iter->SeekToLast();
+  ASSERT_FALSE(iter->Valid());
+  iter->Seek("foo");
+  ASSERT_FALSE(iter->Valid());
+  ASSERT_OK(iter->status());
+}
+
+TEST_F(DBTest, IterateAcrossMemTableAndEveryKindOfTable) {
+  // Spread keys over a deep level, level 1, level 0, and the memtable,
+  // with overwrites and deletes between the layers.
+  ASSERT_OK(Put("a", "a-deep"));
+  ASSERT_OK(Put("b", "b-deep"));
+  ASSERT_OK(Put("c", "c-deep"));
+  Flush();
+  CompactLevel(0);
+  CompactLevel(1);
+
+  ASSERT_OK(Put("b", "b-l1"));
+  ASSERT_OK(Put("d", "d-l1"));
+  ASSERT_OK(Delete("c"));
+  Flush();
+  CompactLevel(0);
+
+  ASSERT_OK(Put("d", "d-l0"));
+  ASSERT_OK(Put("e", "e-l0"));
+  Flush();
+
+  ASSERT_OK(Put("e", "e-mem"));
+  ASSERT_OK(Put("f", "f-mem"));
+  ASSERT_OK(Delete("a"));
+  ASSERT_EQ("1,1,1", FilesPerLevel());
+
+  ASSERT_EQ("(b->b-l1)(d->d-l0)(e->e-mem)(f->f-mem)", Contents());
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->Seek("c");
+  ASSERT_EQ("d", iter->key());
+  iter->Prev();
+  ASSERT_EQ("b", iter->key());
+  iter->Prev();
+  ASSERT_FALSE(iter->Valid());  // "a" is deleted
+  iter->Seek("f");
+  ASSERT_EQ("f-mem", iter->value());
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  iter.reset();
+
+  Reopen();
+  ASSERT_EQ("(b->b-l1)(d->d-l0)(e->e-mem)(f->f-mem)", Contents());
+}
+
+TEST_F(DBTest, IteratorIsUnaffectedByLaterWritesFlushesAndCompactions) {
+  ASSERT_OK(Put("a", "a1"));
+  ASSERT_OK(Put("b", "b1"));
+  Flush();
+  ASSERT_OK(Put("c", "c1"));
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->SeekToFirst();
+  ASSERT_EQ("a", iter->key());
+
+  // Change everything underneath it.
+  ASSERT_OK(Put("a", "a2"));
+  ASSERT_OK(Delete("b"));
+  ASSERT_OK(Put("bb", "new"));
+  ASSERT_OK(Delete("c"));
+  ASSERT_OK(db_->CompactRange(nullptr, nullptr));
+  ASSERT_EQ("(a->a2)(bb->new)", Contents());
+
+  // The iterator still walks the state it was created in.
+  ASSERT_EQ("a1", iter->value());
+  iter->Next();
+  ASSERT_EQ("b", iter->key());
+  ASSERT_EQ("b1", iter->value());
+  iter->Next();
+  ASSERT_EQ("c", iter->key());
+  ASSERT_EQ("c1", iter->value());
+  iter->Next();
+  ASSERT_FALSE(iter->Valid());
+  iter->SeekToFirst();
+  ASSERT_EQ("a1", iter->value());
+  ASSERT_OK(iter->status());
+}
+
+TEST_F(DBTest, FilesAnIteratorNeedsAreKeptUntilItIsDeleted) {
+  for (int i = 0; i < 100; i++) ASSERT_OK(Put("key" + std::to_string(i), "old"));
+  Flush();
+  const std::vector<std::string> old_tables = FilesOfType(FileType::kTableFile);
+  ASSERT_EQ(1u, old_tables.size());
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->SeekToFirst();
+
+  // Rewrite everything and compact: the old table is no longer part of the
+  // current version.
+  for (int i = 0; i < 100; i++) ASSERT_OK(Put("key" + std::to_string(i), "new"));
+  ASSERT_OK(db_->CompactRange(nullptr, nullptr));
+  ASSERT_EQ(1, TotalTableFiles());
+  // But the iterator reads from it, so it must still be on disk.
+  ASSERT_TRUE(std::filesystem::exists(old_tables[0]));
+  ASSERT_EQ(2u, FilesOfType(FileType::kTableFile).size());
+
+  int n = 0;
+  for (; iter->Valid(); iter->Next(), n++) ASSERT_EQ("old", iter->value());
+  ASSERT_EQ(100, n);
+  ASSERT_OK(iter->status());
+
+  // Once the iterator is gone the next cleanup removes the file.
+  iter.reset();
+  ASSERT_OK(Put("trigger", "cleanup"));
+  Flush();
+  ASSERT_FALSE(std::filesystem::exists(old_tables[0]));
+}
+
+// Claim 3: a read at an old snapshot sees the old value even after the key
+// has been overwritten, deleted, and compacted.
+TEST_F(DBTest, SnapshotSeesItsValueAfterOverwriteDeleteAndCompaction) {
+  ASSERT_OK(Put("k", "v1"));
+  ASSERT_OK(Put("other", "o1"));
+  const Snapshot* s1 = db_->GetSnapshot();
+  ASSERT_OK(Put("k", "v2"));
+  const Snapshot* s2 = db_->GetSnapshot();
+  ASSERT_OK(Delete("k"));
+  const Snapshot* s3 = db_->GetSnapshot();
+  ASSERT_OK(Put("other", "o2"));
+
+  auto check = [&] {
+    ASSERT_EQ("v1", GetAt(s1, "k"));
+    ASSERT_EQ("v2", GetAt(s2, "k"));
+    ASSERT_EQ("NOT_FOUND", GetAt(s3, "k"));
+    ASSERT_EQ("NOT_FOUND", Get("k"));
+    ASSERT_EQ("o1", GetAt(s1, "other"));
+    ASSERT_EQ("o1", GetAt(s3, "other"));
+    ASSERT_EQ("o2", Get("other"));
+
+    ReadOptions at_s1, at_s2, at_s3;
+    at_s1.snapshot = s1;
+    at_s2.snapshot = s2;
+    at_s3.snapshot = s3;
+    ASSERT_EQ("(k->v1)(other->o1)", Contents(at_s1));
+    ASSERT_EQ("(k->v2)(other->o1)", Contents(at_s2));
+    ASSERT_EQ("(other->o1)", Contents(at_s3));
+    ASSERT_EQ("(other->o2)", Contents());
+  };
+
+  check();  // everything still in the memtable
+  Flush();
+  check();  // in a level-0 table
+  ASSERT_OK(db_->CompactRange(nullptr, nullptr));
+  check();  // compacted: the versions the snapshots need were kept
+  CompactLevel(1);
+  CompactLevel(2);
+  check();  // and pushed further down
+
+  // Each release lets the next compaction discard what only that snapshot
+  // needed.
+  db_->ReleaseSnapshot(s1);
+  ASSERT_OK(db_->CompactRange(nullptr, nullptr));
+  ASSERT_EQ("v2", GetAt(s2, "k"));
+  ASSERT_EQ("NOT_FOUND", GetAt(s3, "k"));
+
+  db_->ReleaseSnapshot(s2);
+  db_->ReleaseSnapshot(s3);
+  ASSERT_OK(db_->CompactRange(nullptr, nullptr));
+  ASSERT_EQ("NOT_FOUND", Get("k"));
+  ASSERT_EQ("(other->o2)", Contents());
+}
+
+TEST_F(DBTest, ReleasingSnapshotsLetsCompactionReclaimSpace) {
+  const std::string big(10000, 'x');
+  ASSERT_OK(Put("k", big));
+  const Snapshot* snapshot = db_->GetSnapshot();
+  ASSERT_OK(Delete("k"));
+  ASSERT_OK(db_->CompactRange(nullptr, nullptr));
+  // The snapshot still reads the value, so it is still stored.
+  ASSERT_GT(TotalTableBytes(), big.size());
+  ASSERT_EQ(big, GetAt(snapshot, "k"));
+
+  // CompactRange pushes data down to the deepest level that holds any; it
+  // does not rewrite that level in place. Compact the level itself.
+  db_->ReleaseSnapshot(snapshot);
+  ASSERT_EQ("0,1", FilesPerLevel());
+  CompactLevel(1);
+  ASSERT_EQ(0u, TotalTableBytes());
+}
+
+TEST_F(DBTest, SnapshotOfATombstoneOverADeeperValue) {
+  // The snapshot is taken after the delete. Compacting must keep the
+  // tombstone for it even though no other snapshot needs the key.
+  ASSERT_OK(Put("k", "v1"));
+  Flush();
+  CompactLevel(0);
+  CompactLevel(1);
+  ASSERT_OK(Delete("k"));
+  const Snapshot* after_delete = db_->GetSnapshot();
+  ASSERT_OK(Put("k", "v2"));
+  Flush();
+  CompactLevel(0);
+  ASSERT_EQ("NOT_FOUND", GetAt(after_delete, "k"));
+  ASSERT_EQ("v2", Get("k"));
+  CompactLevel(1);
+  ASSERT_EQ("NOT_FOUND", GetAt(after_delete, "k"));
+  ASSERT_EQ("v2", Get("k"));
+  db_->ReleaseSnapshot(after_delete);
+}
+
 // Small buffers, small tables, and small level targets, so that a few
 // megabytes of writes spread across several levels.
 class DBCompactionTest : public DBTest {
@@ -971,6 +1219,222 @@ TEST_F(DBCompactionTest, OperationsAgainstAModelWithFlushesCompactionsAndRestart
       if (HasFatalFailure()) return;
     }
     VerifyAgainst(model, kKeySpace);
+  }
+}
+
+TEST_F(DBCompactionTest, LongLivedIteratorSurvivesHeavyCompaction) {
+  constexpr int kKeys = 1500;
+  for (int k = 0; k < kKeys; k++) ASSERT_OK(Put(Key(k), "original" + std::to_string(k)));
+
+  std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+  iter->SeekToFirst();
+
+  // Advance the iterator a little at a time while everything it is reading
+  // is overwritten, deleted, flushed, and compacted several times over.
+  int seen = 0;
+  for (int round = 0; round < 15; round++) {
+    for (int k = 0; k < kKeys; k++) {
+      if ((k + round) % 7 == 0) {
+        ASSERT_OK(Delete(Key(k)));
+      } else {
+        ASSERT_OK(Put(Key(k), "round" + std::to_string(round) + std::string(200, 'x')));
+      }
+    }
+    for (int step = 0; step < kKeys / 15 && iter->Valid(); step++, seen++, iter->Next()) {
+      ASSERT_EQ(Key(seen), iter->key());
+      ASSERT_EQ("original" + std::to_string(seen), iter->value());
+    }
+  }
+  WaitForBackground();
+  for (; iter->Valid(); seen++, iter->Next()) {
+    ASSERT_EQ(Key(seen), iter->key());
+    ASSERT_EQ("original" + std::to_string(seen), iter->value());
+  }
+  ASSERT_OK(iter->status());
+  ASSERT_EQ(kKeys, seen);
+
+  // Backward over the same view, long after its files left the current
+  // version.
+  for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+    seen--;
+    ASSERT_EQ(Key(seen), iter->key());
+    ASSERT_EQ("original" + std::to_string(seen), iter->value());
+  }
+  ASSERT_EQ(0, seen);
+  ASSERT_OK(iter->status());
+}
+
+// A batch is atomic and an iterator reads one moment in time: whatever
+// flushes and compactions are running, a scan sees every key at the same
+// version.
+TEST_F(DBCompactionTest, ScansSeeWholeBatchesWhileCompactionsRun) {
+  constexpr int kKeys = 100;
+  constexpr int kVersions = 300;
+  std::atomic<bool> done{false};
+  std::atomic<int> failures{0};
+  std::atomic<int> scans{0};
+
+  auto value = [](int version) { return std::to_string(version) + std::string(150, 'v'); };
+  {
+    WriteBatch batch;
+    for (int k = 0; k < kKeys; k++) batch.Put(Key(k), value(0));
+    ASSERT_OK(db_->Write(WriteOptions(), &batch));
+  }
+
+  std::vector<std::thread> readers;
+  for (int r = 0; r < 4; r++) {
+    readers.emplace_back([&, r] {
+      int last_version = 0;
+      while (!done.load()) {
+        // Even readers scan with a plain iterator; odd ones read key by key
+        // through a snapshot, forward or backward.
+        int version = -1, count = 0;
+        bool consistent = true;
+        if (r % 2 == 0) {
+          std::unique_ptr<Iterator> iter(db_->NewIterator(ReadOptions()));
+          if (r == 0) {
+            for (iter->SeekToFirst(); iter->Valid(); iter->Next(), count++) {
+              const int v = std::stoi(std::string(iter->value()));
+              if (version == -1) version = v;
+              if (v != version) consistent = false;
+            }
+          } else {
+            for (iter->SeekToLast(); iter->Valid(); iter->Prev(), count++) {
+              const int v = std::stoi(std::string(iter->value()));
+              if (version == -1) version = v;
+              if (v != version) consistent = false;
+            }
+          }
+          if (!iter->status().ok()) consistent = false;
+        } else {
+          const Snapshot* snapshot = db_->GetSnapshot();
+          ReadOptions read_options;
+          read_options.snapshot = snapshot;
+          for (int k = 0; k < kKeys; k++, count++) {
+            std::string result;
+            if (!db_->Get(read_options, Key(k), &result).ok()) {
+              consistent = false;
+              break;
+            }
+            const int v = std::stoi(result);
+            if (version == -1) version = v;
+            if (v != version) consistent = false;
+          }
+          db_->ReleaseSnapshot(snapshot);
+        }
+        if (!consistent || count != kKeys || version < last_version) failures++;
+        last_version = version;
+        scans++;
+      }
+    });
+  }
+
+  for (int version = 1; version <= kVersions; version++) {
+    WriteBatch batch;
+    for (int k = 0; k < kKeys; k++) batch.Put(Key(k), value(version));
+    ASSERT_OK(db_->Write(WriteOptions(), &batch));
+  }
+  done.store(true);
+  for (std::thread& t : readers) t.join();
+  ASSERT_EQ(0, failures.load());
+  ASSERT_GT(scans.load(), 0);
+  WaitForBackground();
+  ASSERT_OK(impl()->TEST_CheckInvariants());
+}
+
+// The model test: a std::map kept alongside the database through a random
+// sequence of puts, deletes, batches, flushes, compactions, snapshots, and
+// restarts. After every step a full scan, forward and backward, must match
+// the map; every live snapshot must still match the map as it was when the
+// snapshot was taken.
+TEST_F(DBCompactionTest, FullScanEquivalenceWithAModelAfterEveryStep) {
+  using Model = std::map<std::string, std::string>;
+  constexpr int kKeySpace = 120;
+
+  auto render = [](const Model& model) {
+    std::string out;
+    for (const auto& [k, v] : model) out += "(" + k + "->" + v + ")";
+    return out;
+  };
+
+  for (uint32_t seed = 0; seed < 4; seed++) {
+    SCOPED_TRACE("seed " + std::to_string(seed));
+    Close();
+    std::filesystem::remove_all(dbname_);
+    Reopen();
+    std::mt19937 rnd(seed);
+    Model model;
+    struct LiveSnapshot {
+      const Snapshot* snapshot;
+      std::string expected;
+    };
+    std::vector<LiveSnapshot> snapshots;
+    auto release_all = [&] {
+      for (const LiveSnapshot& s : snapshots) db_->ReleaseSnapshot(s.snapshot);
+      snapshots.clear();
+    };
+
+    for (int step = 0; step < 1200; step++) {
+      SCOPED_TRACE("step " + std::to_string(step));
+      const uint32_t op = rnd() % 100;
+      const std::string key = Key(rnd() % kKeySpace);
+      if (op < 40) {
+        const std::string value = "v" + std::to_string(step) + std::string(rnd() % 300, 'x');
+        ASSERT_OK(Put(key, value));
+        model[key] = value;
+      } else if (op < 60) {
+        ASSERT_OK(Delete(key));
+        model.erase(key);
+      } else if (op < 68) {
+        WriteBatch batch;
+        for (int i = 0, n = 1 + rnd() % 10; i < n; i++) {
+          const std::string k = Key(rnd() % kKeySpace);
+          if (rnd() % 3 == 0) {
+            batch.Delete(k);
+            model.erase(k);
+          } else {
+            const std::string value = "b" + std::to_string(step) + "-" + std::to_string(i);
+            batch.Put(k, value);
+            model[k] = value;
+          }
+        }
+        ASSERT_OK(db_->Write(WriteOptions(), &batch));
+      } else if (op < 74) {
+        Flush();
+      } else if (op < 78) {
+        const std::string a = Key(rnd() % kKeySpace), b = Key(rnd() % kKeySpace);
+        const Slice begin = std::min(a, b), end = std::max(a, b);
+        ASSERT_OK(db_->CompactRange(&begin, &end));
+      } else if (op < 80) {
+        ASSERT_OK(db_->CompactRange(nullptr, nullptr));
+      } else if (op < 88) {
+        if (snapshots.size() < 6) {
+          snapshots.push_back({db_->GetSnapshot(), render(model)});
+        }
+      } else if (op < 96) {
+        if (!snapshots.empty()) {
+          const size_t i = rnd() % snapshots.size();
+          db_->ReleaseSnapshot(snapshots[i].snapshot);
+          snapshots.erase(snapshots.begin() + i);
+        }
+      } else if (op < 98) {
+        release_all();  // snapshots do not outlive the database object
+        Reopen();
+      }
+
+      ASSERT_EQ(render(model), Contents());
+      for (const LiveSnapshot& s : snapshots) {
+        ReadOptions read_options;
+        read_options.snapshot = s.snapshot;
+        ASSERT_EQ(s.expected, Contents(read_options));
+      }
+      if (HasFailure()) {
+        release_all();
+        return;
+      }
+    }
+    ASSERT_OK(impl()->TEST_CheckInvariants());
+    release_all();
   }
 }
 
