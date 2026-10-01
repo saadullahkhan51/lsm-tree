@@ -4,10 +4,12 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "db/db_impl.h"
 #include "db/filename.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
@@ -43,28 +45,36 @@ class DBTest : public testing::Test {
 
   Status Delete(const std::string& key) { return db_->Delete(WriteOptions(), key); }
 
+  DBImpl* impl() { return static_cast<DBImpl*>(db_); }
+
+  // Moves everything written so far out of the memtable into a table.
+  void Flush() { ASSERT_OK(impl()->TEST_FlushMemTable()); }
+
+  int NumFilesAtLevel(int level) { return impl()->TEST_NumFilesAtLevel(level); }
+
+  // Paths of the files of one type, lowest number first.
+  std::vector<std::string> FilesOfType(FileType wanted) {
+    std::vector<std::pair<uint64_t, std::string>> found;
+    for (const auto& entry : std::filesystem::directory_iterator(dbname_)) {
+      uint64_t number;
+      FileType type;
+      if (ParseFileName(entry.path().filename().string(), &number, &type) && type == wanted) {
+        found.emplace_back(number, entry.path().string());
+      }
+    }
+    std::sort(found.begin(), found.end());
+    std::vector<std::string> paths;
+    for (auto& [number, path] : found) paths.push_back(path);
+    return paths;
+  }
+
+  std::vector<std::string> LogFiles() { return FilesOfType(FileType::kLogFile); }
+
   std::string Get(const std::string& key) {
     std::string value;
     Status s = db_->Get(ReadOptions(), key, &value);
     if (s.IsNotFound()) return "NOT_FOUND";
     return s.ok() ? value : s.ToString();
-  }
-
-  // Paths of the write-ahead logs, oldest first.
-  std::vector<std::string> LogFiles() {
-    std::vector<std::pair<uint64_t, std::string>> logs;
-    for (const auto& entry : std::filesystem::directory_iterator(dbname_)) {
-      uint64_t number;
-      FileType type;
-      if (ParseFileName(entry.path().filename().string(), &number, &type) &&
-          type == FileType::kLogFile) {
-        logs.emplace_back(number, entry.path().string());
-      }
-    }
-    std::sort(logs.begin(), logs.end());
-    std::vector<std::string> paths;
-    for (auto& [number, path] : logs) paths.push_back(path);
-    return paths;
   }
 
   static std::string ReadFile(const std::string& path) {
@@ -212,7 +222,11 @@ TEST_F(DBTest, TruncatedLogTailRecoversAPrefix) {
   }
   ASSERT_EQ("NOT_FOUND", Get("key9"));
 
-  // The torn log stays behind; new writes go to a new one and both replay.
+  // Recovery moved what it replayed into a table and retired the torn log.
+  ASSERT_EQ(1, NumFilesAtLevel(0));
+  ASSERT_EQ(1u, LogFiles().size());
+  ASSERT_NE(logs[0], LogFiles()[0]);
+
   ASSERT_OK(Put("key9", "second-try"));
   Reopen();
   ASSERT_EQ("value8", Get("key8"));
@@ -237,12 +251,14 @@ TEST_F(DBTest, CorruptLogFailsOpen) {
 }
 
 TEST_F(DBTest, MissingLogRecordFailsOpen) {
-  // Build a log by hand whose second record skips a sequence number.
+  // Replace the live log with one whose second record skips a sequence
+  // number, as if a record in between had vanished.
   Close();
-  const std::string fresh = test::NewTestDir("db_test_gap");
+  const std::vector<std::string> logs = LogFiles();
+  ASSERT_EQ(1u, logs.size());
   {
     std::unique_ptr<WritableFile> file;
-    ASSERT_OK(Env::Default()->NewWritableFile(LogFileName(fresh, 1), &file));
+    ASSERT_OK(Env::Default()->NewWritableFile(logs[0], &file));
     log::Writer writer(file.get());
     WriteBatch batch;
     batch.Put("a", "1");
@@ -252,9 +268,9 @@ TEST_F(DBTest, MissingLogRecordFailsOpen) {
     ASSERT_OK(writer.AddRecord(WriteBatchInternal::Contents(&batch)));
     ASSERT_OK(file->Close());
   }
-  DB* db = nullptr;
-  Status s = DB::Open(options_, fresh, &db);
+  Status s = TryReopen();
   ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(std::string::npos, s.ToString().find("sequence gap")) << s.ToString();
 }
 
 TEST_F(DBTest, WriteErrorIsSticky) {
@@ -345,6 +361,260 @@ TEST_F(DBTest, GroupCommitWithManyWriters) {
 
   Reopen();
   verify();
+}
+
+// --- Tables and versions ---
+
+TEST_F(DBTest, GetFromTablesAfterFlush) {
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_OK(Put("bar", "b1"));
+  Flush();
+  ASSERT_EQ(1, NumFilesAtLevel(0));
+  ASSERT_EQ("v1", Get("foo"));
+  ASSERT_EQ("b1", Get("bar"));
+  ASSERT_EQ("NOT_FOUND", Get("baz"));
+}
+
+TEST_F(DBTest, NewerDataShadowsOlderAcrossMemTableAndTables) {
+  // Three generations of the same keys: oldest table, newer table, memtable.
+  ASSERT_OK(Put("a", "a1"));
+  ASSERT_OK(Put("b", "b1"));
+  ASSERT_OK(Put("c", "c1"));
+  ASSERT_OK(Put("d", "d1"));
+  Flush();
+
+  ASSERT_OK(Put("a", "a2"));
+  ASSERT_OK(Delete("b"));
+  Flush();
+  ASSERT_EQ(2, NumFilesAtLevel(0));
+
+  ASSERT_OK(Put("a", "a3"));
+  ASSERT_OK(Delete("c"));
+
+  ASSERT_EQ("a3", Get("a"));         // memtable over both tables
+  ASSERT_EQ("NOT_FOUND", Get("b"));  // tombstone in the newer table hides the older value
+  ASSERT_EQ("NOT_FOUND", Get("c"));  // tombstone in the memtable hides a table value
+  ASSERT_EQ("d1", Get("d"));         // only in the oldest table
+
+  // The same answers once everything is in tables, and after a restart.
+  Flush();
+  ASSERT_EQ(3, NumFilesAtLevel(0));
+  for (int pass = 0; pass < 2; pass++) {
+    ASSERT_EQ("a3", Get("a"));
+    ASSERT_EQ("NOT_FOUND", Get("b"));
+    ASSERT_EQ("NOT_FOUND", Get("c"));
+    ASSERT_EQ("d1", Get("d"));
+    Reopen();
+  }
+}
+
+TEST_F(DBTest, DeletedKeyCanBeRewritten) {
+  ASSERT_OK(Put("k", "v1"));
+  Flush();
+  ASSERT_OK(Delete("k"));
+  Flush();
+  ASSERT_OK(Put("k", "v2"));
+  ASSERT_EQ("v2", Get("k"));
+  Flush();
+  ASSERT_EQ("v2", Get("k"));
+}
+
+TEST_F(DBTest, FullMemTableIsFlushedInTheBackground) {
+  Close();
+  options_.write_buffer_size = 64 << 10;
+  Reopen();
+
+  const std::string value(1000, 'x');
+  for (int i = 0; i < 1000; i++) {  // about 1 MiB through a 64 KiB buffer
+    ASSERT_OK(Put("key" + std::to_string(i), value + std::to_string(i)));
+  }
+  ASSERT_GE(NumFilesAtLevel(0), 5);
+  for (int i = 0; i < 1000; i++) {
+    ASSERT_EQ(value + std::to_string(i), Get("key" + std::to_string(i)));
+  }
+  ASSERT_OK(impl()->TEST_CheckInvariants());
+
+  Reopen();
+  for (int i = 0; i < 1000; i++) {
+    ASSERT_EQ(value + std::to_string(i), Get("key" + std::to_string(i)));
+  }
+}
+
+TEST_F(DBTest, ReadsStayCorrectWhileFlushesRun) {
+  Close();
+  options_.write_buffer_size = 32 << 10;
+  Reopen();
+
+  // The writer overwrites a fixed set of keys with increasing versions and
+  // publishes the last version it finished. Readers must never see a key
+  // go backwards or disappear, whichever of the memtable, the immutable
+  // memtable, or a table currently holds its newest version.
+  constexpr int kKeys = 50;
+  std::atomic<int> published{0};
+  std::atomic<bool> done{false};
+  std::atomic<int> failures{0};
+  auto key = [](int k) { return "key" + std::to_string(k); };
+  auto value = [](int version) { return std::to_string(version) + std::string(500, 'v'); };
+
+  std::vector<std::thread> readers;
+  for (int r = 0; r < 4; r++) {
+    readers.emplace_back([&, r] {
+      std::mt19937 rnd(r);
+      while (!done.load()) {
+        const int floor = published.load();
+        std::string result;
+        Status s = db_->Get(ReadOptions(), key(rnd() % kKeys), &result);
+        if (floor == 0 && s.IsNotFound()) continue;
+        if (!s.ok() || std::stoi(result) < floor) failures++;
+      }
+    });
+  }
+
+  for (int version = 1; version <= 60; version++) {
+    for (int k = 0; k < kKeys; k++) ASSERT_OK(Put(key(k), value(version)));
+    published.store(version);
+  }
+  done.store(true);
+  for (std::thread& t : readers) t.join();
+  ASSERT_EQ(0, failures.load());
+  ASSERT_GT(NumFilesAtLevel(0), 10);
+  for (int k = 0; k < kKeys; k++) ASSERT_EQ(value(60), Get(key(k)));
+}
+
+TEST_F(DBTest, RecoveryFlushesTheLogAndRetiresIt) {
+  ASSERT_OK(Put("foo", "v1"));
+  ASSERT_EQ(0, NumFilesAtLevel(0));
+  const std::vector<std::string> before = LogFiles();
+  ASSERT_EQ(1u, before.size());
+
+  Reopen();
+  ASSERT_EQ(1, NumFilesAtLevel(0));
+  ASSERT_EQ("v1", Get("foo"));
+  const std::vector<std::string> after = LogFiles();
+  ASSERT_EQ(1u, after.size());
+  ASSERT_NE(before[0], after[0]);
+
+  // Reopening with nothing new written adds no table.
+  Reopen();
+  ASSERT_EQ(1, NumFilesAtLevel(0));
+  ASSERT_EQ(1u, FilesOfType(FileType::kDescriptorFile).size());
+  ASSERT_EQ(0u, FilesOfType(FileType::kTempFile).size());
+}
+
+TEST_F(DBTest, RecoveryWithALogLargerThanTheWriteBuffer) {
+  // The log holds several memtables' worth; recovery must spill to tables
+  // as it replays rather than hold it all in memory.
+  const std::string value(10000, 'x');
+  for (int i = 0; i < 100; i++) ASSERT_OK(Put("key" + std::to_string(i), value));
+  Close();
+  options_.write_buffer_size = 100 << 10;
+  Reopen();
+  ASSERT_GE(NumFilesAtLevel(0), 5);
+  for (int i = 0; i < 100; i++) ASSERT_EQ(value, Get("key" + std::to_string(i)));
+}
+
+TEST_F(DBTest, ObsoleteFilesAreRemoved) {
+  for (int round = 0; round < 5; round++) {
+    ASSERT_OK(Put("key" + std::to_string(round), "v"));
+    Flush();
+  }
+  // One log (the live one), one manifest, five tables.
+  ASSERT_EQ(1u, LogFiles().size());
+  ASSERT_EQ(1u, FilesOfType(FileType::kDescriptorFile).size());
+  ASSERT_EQ(5u, FilesOfType(FileType::kTableFile).size());
+
+  // A stray table no version refers to is cleaned up on open.
+  Close();
+  WriteFile(TableFileName(dbname_, 999999), "not a table, and nobody's table");
+  Reopen();
+  ASSERT_FALSE(std::filesystem::exists(TableFileName(dbname_, 999999)));
+  ASSERT_EQ(5u, FilesOfType(FileType::kTableFile).size());
+}
+
+TEST_F(DBTest, MissingTableFailsOpen) {
+  ASSERT_OK(Put("foo", "v1"));
+  Flush();
+  Close();
+  const std::vector<std::string> tables = FilesOfType(FileType::kTableFile);
+  ASSERT_EQ(1u, tables.size());
+  std::filesystem::remove(tables[0]);
+
+  Status s = TryReopen();
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(std::string::npos, s.ToString().find("missing")) << s.ToString();
+}
+
+TEST_F(DBTest, DamagedTableBlockIsReportedNotSkipped) {
+  for (int i = 0; i < 100; i++) {
+    ASSERT_OK(Put("key" + std::to_string(i), std::string(100, static_cast<char>('a' + i % 26))));
+  }
+  Flush();
+  Close();
+  const std::vector<std::string> tables = FilesOfType(FileType::kTableFile);
+  ASSERT_EQ(1u, tables.size());
+  std::string contents = ReadFile(tables[0]);
+  contents[contents.size() / 3] ^= 0x01;  // inside a data block
+  WriteFile(tables[0], contents);
+
+  ASSERT_OK(TryReopen());
+  int corrupt = 0;
+  for (int i = 0; i < 100; i++) {
+    std::string value;
+    Status s = db_->Get(ReadOptions(), "key" + std::to_string(i), &value);
+    if (s.ok()) {
+      ASSERT_EQ(std::string(100, static_cast<char>('a' + i % 26)), value) << i;
+    } else {
+      // Keys in the damaged block fail loudly. NotFound would be a lie.
+      ASSERT_TRUE(s.IsCorruption()) << i << ": " << s.ToString();
+      corrupt++;
+    }
+  }
+  ASSERT_GT(corrupt, 0);
+  ASSERT_LT(corrupt, 100);
+}
+
+TEST_F(DBTest, DamagedManifestFailsOpen) {
+  ASSERT_OK(Put("foo", "v1"));
+  Flush();
+  Close();
+  const std::vector<std::string> manifests = FilesOfType(FileType::kDescriptorFile);
+  ASSERT_EQ(1u, manifests.size());
+  std::string contents = ReadFile(manifests[0]);
+  contents[contents.size() / 2] ^= 0x01;
+  WriteFile(manifests[0], contents);
+
+  Status s = TryReopen();
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+}
+
+TEST_F(DBTest, MissingCurrentWithDataPresentIsNotTreatedAsANewDatabase) {
+  ASSERT_OK(Put("foo", "v1"));
+  Flush();
+  Close();
+  std::filesystem::remove(CurrentFileName(dbname_));
+
+  // Starting a fresh manifest here would orphan the tables and the next
+  // cleanup would delete them.
+  Status s = TryReopen();
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_EQ(1u, FilesOfType(FileType::kTableFile).size());
+}
+
+TEST_F(DBTest, SequenceNumbersSurviveWhenEveryLogIsGone) {
+  // After a flush and a reopen no log holds the old writes. New writes
+  // must still get sequence numbers above them, or the old table entries
+  // would shadow the new values.
+  ASSERT_OK(Put("k", "old"));
+  for (int i = 0; i < 100; i++) ASSERT_OK(Put("filler" + std::to_string(i), "x"));
+  Flush();
+  Reopen();
+  Reopen();
+  ASSERT_OK(Put("k", "new"));
+  ASSERT_EQ("new", Get("k"));
+  Flush();
+  ASSERT_EQ("new", Get("k"));
+  Reopen();
+  ASSERT_EQ("new", Get("k"));
 }
 
 }  // namespace lsm

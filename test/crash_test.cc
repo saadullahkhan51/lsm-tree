@@ -74,18 +74,65 @@ TEST_F(CrashTest, UnsyncedWritesAreLostButTheDatabaseOpens) {
   for (int i = 51; i < 100; i++) ASSERT_FALSE(Has(i)) << i;
 }
 
-// The log file is created when the database opens. If the directory is not
-// synced after that, the file itself can vanish on power loss, taking
-// synced writes with it. The database does sync it (SyncedWritesSurvive
-// passes); this shows what happens to an engine that does not.
-TEST_F(CrashTest, WithoutTheDirectorySyncSyncedWritesAreLost) {
-  env_.SetDropDirSyncs(true);
+// What the directory syncs are for. With them disabled (the Env reports
+// success and does nothing), a new file or a rename is not durable, and a
+// power failure takes it back.
+//
+// Opening an existing database starts a new manifest, renames a temp file
+// over CURRENT to point at it, and then deletes the old manifest. Without
+// the directory sync after the rename, power loss can undo the rename while
+// the deletion stands: CURRENT names a manifest that is gone and the
+// database cannot be opened.
+TEST_F(CrashTest, WithoutTheDirectorySyncCurrentCanPointAtNothing) {
   Open();
   for (int i = 0; i < 10; i++) ASSERT_OK(Put(i, /*sync=*/true));
+  delete db_;
+  db_ = nullptr;
+
+  env_.SetDropDirSyncs(true);
+  Open();
+  for (int i = 10; i < 20; i++) ASSERT_OK(Put(i, /*sync=*/true));
   Crash();
   env_.SetDropDirSyncs(false);
+
+  Status s = DB::Open(options_, dbname_, &db_);
+  ASSERT_TRUE(s.IsCorruption()) << s.ToString();
+  ASSERT_NE(std::string::npos, s.ToString().find("CURRENT points to a manifest")) << s.ToString();
+}
+
+// The same sequence with the directory syncs working: nothing is lost.
+TEST_F(CrashTest, WithTheDirectorySyncReopenedDatabaseSurvives) {
   Open();
-  for (int i = 0; i < 10; i++) ASSERT_FALSE(Has(i)) << i;
+  for (int i = 0; i < 10; i++) ASSERT_OK(Put(i, /*sync=*/true));
+  delete db_;
+  db_ = nullptr;
+
+  Open();
+  for (int i = 10; i < 20; i++) ASSERT_OK(Put(i, /*sync=*/true));
+  Crash();
+
+  Open();
+  for (int i = 0; i < 20; i++) ASSERT_TRUE(Has(i)) << i;
+}
+
+// A crash while flushes are running: tables being written, the manifest
+// being appended to, logs being retired.
+TEST_F(CrashTest, SyncedWritesSurviveACrashDuringFlushes) {
+  options_.write_buffer_size = 16 << 10;
+  for (uint32_t seed = 0; seed < 10; seed++) {
+    SCOPED_TRACE("seed " + std::to_string(seed));
+    std::mt19937 rnd(seed);
+    std::filesystem::remove_all(dbname_);
+    Open();
+    const int writes = 200 + rnd() % 400;
+    for (int i = 0; i < writes; i++) ASSERT_OK(Put(i, /*sync=*/true));
+    Crash(&rnd);
+    Open();
+    for (int i = 0; i < writes; i++) ASSERT_TRUE(Has(i)) << i;
+    ASSERT_FALSE(Has(writes));
+    delete db_;
+    db_ = nullptr;
+  }
 }
 
 // Crash with torn writes, over and over, in one database. After each crash
@@ -93,6 +140,8 @@ TEST_F(CrashTest, WithoutTheDirectorySyncSyncedWritesAreLost) {
 // least as long as the last synced write; the database then carries on from
 // there.
 TEST_F(CrashTest, RepeatedTornCrashesRecoverAPrefixEveryTime) {
+  // Small enough that most generations flush, some more than once.
+  options_.write_buffer_size = 32 << 10;
   for (uint32_t seed = 0; seed < 20; seed++) {
     SCOPED_TRACE("seed " + std::to_string(seed));
     std::mt19937 rnd(seed);

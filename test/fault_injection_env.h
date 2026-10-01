@@ -9,6 +9,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "lsm/env.h"
 
@@ -16,19 +17,22 @@ namespace lsm::test {
 
 // An Env that models what survives power loss.
 //
-// It tracks, for every file written through it, how many bytes have been
-// synced, and for every file created through it, whether the directory has
-// been synced since. SimulateCrash() then makes the real files match what a
-// disk would hold after losing power:
+// POSIX makes two separate promises. Syncing a file makes its contents
+// durable. Syncing a directory makes its entries durable: that a file was
+// created in it, or renamed within it. This Env tracks both, for every
+// file written, created, or renamed through it. SimulateCrash() then makes
+// the real files match what a disk could hold after losing power:
 //
-//   - a file whose directory entry was never synced is gone;
+//   - a rename whose directory was not synced since is undone;
+//   - a file created in a directory that was not synced since is gone;
 //   - every other file is cut back to its synced length, optionally keeping
 //     a random prefix of the unsynced tail (a torn write).
 //
-// Each file loses its tail independently, which also covers the case where
-// the filesystem persisted unsynced writes to different files out of order.
+// Each file loses its tail independently, which also covers a filesystem
+// persisting unsynced writes to different files out of order.
 //
-// Real fsyncs are skipped: durability is simulated, and they are slow.
+// Removals take effect at once. Real fsyncs are skipped: durability is
+// simulated, and they are slow.
 class FaultInjectionEnv : public EnvWrapper {
  public:
   explicit FaultInjectionEnv(Env* base) : EnvWrapper(base) {}
@@ -52,6 +56,22 @@ class FaultInjectionEnv : public EnvWrapper {
   // unsynced tail instead of losing all of it.
   Status SimulateCrash(std::mt19937* torn = nullptr) {
     std::lock_guard lock(mutex_);
+
+    // Undo renames, newest first.
+    for (auto it = pending_renames_.rbegin(); it != pending_renames_.rend(); ++it) {
+      if (::rename(it->dst.c_str(), it->src.c_str()) != 0) {
+        return Status::IOError(it->dst, "could not undo rename");
+      }
+      MoveState(it->dst, it->src);
+      if (!it->backup.empty()) {
+        // dst had an earlier file under that name; it comes back.
+        if (::rename(it->backup.c_str(), it->dst.c_str()) != 0) {
+          return Status::IOError(it->backup, "could not restore renamed-over file");
+        }
+      }
+    }
+    pending_renames_.clear();
+
     for (const std::string& fname : created_since_dir_sync_) {
       ::unlink(fname.c_str());
       files_.erase(fname);
@@ -70,7 +90,7 @@ class FaultInjectionEnv : public EnvWrapper {
       if (::truncate(fname.c_str(), static_cast<off_t>(keep)) != 0) {
         return Status::IOError(fname, "truncate failed");
       }
-      state.written = state.synced = keep;
+      state.synced = keep;
     }
     return Status::OK();
   }
@@ -103,20 +123,67 @@ class FaultInjectionEnv : public EnvWrapper {
     return s;
   }
 
+  Status RenameFile(const std::string& src, const std::string& dst) override {
+    Status s = CheckActive(src);
+    if (!s.ok()) return s;
+    std::lock_guard lock(mutex_);
+
+    // Keep whatever dst names now reachable under another name, so that the
+    // rename can be undone.
+    PendingRename pending{src, dst, ""};
+    if (target()->FileExists(dst)) {
+      pending.backup = dst + kBackupMarker + std::to_string(next_backup_++);
+      if (::link(dst.c_str(), pending.backup.c_str()) != 0) {
+        return Status::IOError(dst, "could not back up rename target");
+      }
+    }
+    s = target()->RenameFile(src, dst);
+    if (!s.ok()) {
+      if (!pending.backup.empty()) ::unlink(pending.backup.c_str());
+      return s;
+    }
+    MoveState(src, dst);
+    pending_renames_.push_back(std::move(pending));
+    return Status::OK();
+  }
+
   Status SyncDir(const std::string& dir) override {
     Status s = CheckActive(dir);
     if (!s.ok()) return s;
     std::lock_guard lock(mutex_);
     if (drop_dir_syncs_) return Status::OK();
+
+    const std::string prefix = dir + "/";
     std::erase_if(created_since_dir_sync_,
-                  [&](const std::string& fname) { return fname.starts_with(dir + "/"); });
+                  [&](const std::string& fname) { return fname.starts_with(prefix); });
+    std::erase_if(pending_renames_, [&](const PendingRename& r) {
+      if (!r.dst.starts_with(prefix)) return false;
+      if (!r.backup.empty()) ::unlink(r.backup.c_str());
+      return true;
+    });
     return Status::OK();
   }
 
+  Status GetChildren(const std::string& dir, std::vector<std::string>* result) override {
+    Status s = target()->GetChildren(dir, result);
+    // The backups of renamed-over files are bookkeeping, not directory
+    // contents.
+    std::erase_if(*result,
+                  [](const std::string& name) { return name.find(kBackupMarker) != name.npos; });
+    return s;
+  }
+
  private:
+  static constexpr const char* kBackupMarker = ".renamed-over-";
+
   struct FileState {
-    uint64_t written = 0;
     uint64_t synced = 0;
+  };
+
+  struct PendingRename {
+    std::string src;
+    std::string dst;
+    std::string backup;  // where the file dst used to name is kept; empty if none
   };
 
   class TrackedFile : public WritableFile {
@@ -158,10 +225,23 @@ class FaultInjectionEnv : public EnvWrapper {
     return active_ ? Status::OK() : Status::IOError(context, "simulated power loss");
   }
 
+  // REQUIRES: mutex_ held. The file known as from is now known as to.
+  void MoveState(const std::string& from, const std::string& to) {
+    if (auto it = files_.find(from); it != files_.end()) {
+      files_[to] = it->second;
+      files_.erase(from);
+    } else {
+      files_.erase(to);
+    }
+    const bool created = created_since_dir_sync_.erase(from) > 0;
+    created_since_dir_sync_.erase(to);
+    if (created) created_since_dir_sync_.insert(to);
+  }
+
   void RecordSync(const std::string& fname, uint64_t written) {
     std::lock_guard lock(mutex_);
     if (auto it = files_.find(fname); it != files_.end()) {
-      it->second.written = it->second.synced = written;
+      it->second.synced = written;
     }
   }
 
@@ -170,6 +250,8 @@ class FaultInjectionEnv : public EnvWrapper {
   bool drop_dir_syncs_ = false;
   std::map<std::string, FileState> files_;
   std::set<std::string> created_since_dir_sync_;
+  std::vector<PendingRename> pending_renames_;
+  int next_backup_ = 0;
 };
 
 }  // namespace lsm::test
