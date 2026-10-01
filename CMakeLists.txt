@@ -44,3 +44,10 @@ add_executable(lsm_tests ${LSM_TEST_SOURCES})
 target_compile_options(lsm_tests PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(lsm_tests PRIVATE lsm GTest::gtest_main)
 gtest_discover_tests(lsm_tests DISCOVERY_TIMEOUT 60)
+
+# A process that writes until it is killed; process_crash_test runs it.
+add_executable(lsm_kill_child test/kill_child_main.cc)
+target_compile_options(lsm_kill_child PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(lsm_kill_child PRIVATE lsm)
+add_dependencies(lsm_tests lsm_kill_child)
+target_compile_definitions(lsm_tests PRIVATE LSM_KILL_CHILD_PATH="$<TARGET_FILE:lsm_kill_child>")
