@@ -73,6 +73,7 @@ void MemTable::Add(SequenceNumber seq, ValueType type, Slice key, Slice value) {
   std::memcpy(p, value.data(), value.size());
   assert(p + value.size() == buf + encoded_len);
   table_.Insert(buf);
+  num_entries_++;
 }
 
 bool MemTable::Get(const LookupKey& key, std::string* value, Status* s) const {

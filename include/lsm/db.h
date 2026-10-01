@@ -36,6 +36,21 @@ class DB {
   // Stores the value for key in *value. Returns a status for which
   // IsNotFound() is true if there is none.
   virtual Status Get(const ReadOptions& options, const Slice& key, std::string* value) = 0;
+
+  // Reports an aspect of the database's state. Returns false if the
+  // property is not recognized. Properties:
+  //
+  //   "lsm.num-files-at-level<N>"  table files in level N
+  //   "lsm.stall-micros"           total time writes spent stalled
+  //   "lsm.stall-count"            number of writes that were stalled
+  //   "lsm.levels"                 one line per non-empty level: files and bytes
+  virtual bool GetProperty(const Slice& property, std::string* value) = 0;
+
+  // Compacts everything in the key range [*begin, *end] down to the
+  // deepest level that holds any of it, discarding overwritten and deleted
+  // data on the way. A null bound is open: CompactRange(nullptr, nullptr)
+  // compacts the whole database.
+  virtual Status CompactRange(const Slice* begin, const Slice* end) = 0;
 };
 
 }  // namespace lsm

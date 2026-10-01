@@ -33,6 +33,9 @@ class MemTable {
   // Arena bytes in use. Safe to call while the memtable is being modified.
   size_t ApproximateMemoryUsage() const { return arena_.MemoryUsage(); }
 
+  // For the writer only: not synchronized with Add.
+  bool empty() const { return num_entries_ == 0; }
+
   // Adds an entry. For kTypeDeletion, value is ignored and should be empty.
   void Add(SequenceNumber seq, ValueType type, Slice key, Slice value);
 
@@ -61,6 +64,7 @@ class MemTable {
 
   KeyComparator comparator_;
   int refs_ = 0;
+  size_t num_entries_ = 0;
   Arena arena_;
   Table table_;
 };

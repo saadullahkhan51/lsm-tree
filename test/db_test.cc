@@ -3,6 +3,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <random>
 #include <string>
@@ -52,6 +53,45 @@ class DBTest : public testing::Test {
 
   int NumFilesAtLevel(int level) { return impl()->TEST_NumFilesAtLevel(level); }
 
+  int TotalTableFiles() {
+    int total = 0;
+    for (int level = 0; level < config::kNumLevels; level++) total += NumFilesAtLevel(level);
+    return total;
+  }
+
+  uint64_t TotalTableBytes() {
+    uint64_t total = 0;
+    for (int level = 0; level < config::kNumLevels; level++) {
+      total += impl()->TEST_NumBytesAtLevel(level);
+    }
+    return total;
+  }
+
+  // File counts per level with trailing zeros dropped: "2,0,1" means two
+  // files in level 0 and one in level 2.
+  std::string FilesPerLevel() {
+    std::string result;
+    size_t last_non_zero = 0;
+    for (int level = 0; level < config::kNumLevels; level++) {
+      const int n = NumFilesAtLevel(level);
+      result += (level > 0 ? "," : "") + std::to_string(n);
+      if (n > 0) last_non_zero = result.size();
+    }
+    result.resize(last_non_zero);
+    return result;
+  }
+
+  // Lets flushes and automatic compactions run until none is needed.
+  void WaitForBackground() { ASSERT_OK(impl()->TEST_WaitForBackgroundWork()); }
+
+  // Compacts the whole of one level into the next.
+  void CompactLevel(int level) { ASSERT_OK(impl()->TEST_CompactRange(level, nullptr, nullptr)); }
+
+  std::string Property(const std::string& name) {
+    std::string value;
+    return db_->GetProperty(name, &value) ? value : "(unknown property)";
+  }
+
   // Paths of the files of one type, lowest number first.
   std::vector<std::string> FilesOfType(FileType wanted) {
     std::vector<std::pair<uint64_t, std::string>> found;
@@ -89,6 +129,9 @@ class DBTest : public testing::Test {
 
   std::string dbname_;
   Options options_;
+  // An Env that skips real fsyncs, for tests that flush hundreds of times.
+  // Declared before db_ so that it outlives the database.
+  test::FaultInjectionEnv no_sync_env_{Env::Default()};
   DB* db_ = nullptr;
 };
 
@@ -428,7 +471,9 @@ TEST_F(DBTest, FullMemTableIsFlushedInTheBackground) {
   for (int i = 0; i < 1000; i++) {  // about 1 MiB through a 64 KiB buffer
     ASSERT_OK(Put("key" + std::to_string(i), value + std::to_string(i)));
   }
-  ASSERT_GE(NumFilesAtLevel(0), 5);
+  // Flushed many times over; compaction may have merged the tables since.
+  ASSERT_GE(TotalTableFiles(), 1);
+  ASSERT_LT(impl()->TEST_NumBytesAtLevel(0) + 0, uint64_t{2} << 20);
   for (int i = 0; i < 1000; i++) {
     ASSERT_EQ(value + std::to_string(i), Get("key" + std::to_string(i)));
   }
@@ -440,7 +485,7 @@ TEST_F(DBTest, FullMemTableIsFlushedInTheBackground) {
   }
 }
 
-TEST_F(DBTest, ReadsStayCorrectWhileFlushesRun) {
+TEST_F(DBTest, ReadsStayCorrectWhileFlushesAndCompactionsRun) {
   Close();
   options_.write_buffer_size = 32 << 10;
   Reopen();
@@ -477,7 +522,9 @@ TEST_F(DBTest, ReadsStayCorrectWhileFlushesRun) {
   done.store(true);
   for (std::thread& t : readers) t.join();
   ASSERT_EQ(0, failures.load());
-  ASSERT_GT(NumFilesAtLevel(0), 10);
+  WaitForBackground();
+  ASSERT_OK(impl()->TEST_CheckInvariants());
+  ASSERT_LT(NumFilesAtLevel(0), config::kL0_CompactionTrigger);
   for (int k = 0; k < kKeys; k++) ASSERT_EQ(value(60), Get(key(k)));
 }
 
@@ -509,26 +556,28 @@ TEST_F(DBTest, RecoveryWithALogLargerThanTheWriteBuffer) {
   Close();
   options_.write_buffer_size = 100 << 10;
   Reopen();
-  ASSERT_GE(NumFilesAtLevel(0), 5);
+  // Recovery wrote about ten tables; nothing has compacted them yet,
+  // because the background thread starts only after recovery.
+  ASSERT_GE(TotalTableFiles(), 5);
   for (int i = 0; i < 100; i++) ASSERT_EQ(value, Get("key" + std::to_string(i)));
 }
 
 TEST_F(DBTest, ObsoleteFilesAreRemoved) {
-  for (int round = 0; round < 5; round++) {
+  for (int round = 0; round < 3; round++) {
     ASSERT_OK(Put("key" + std::to_string(round), "v"));
     Flush();
   }
-  // One log (the live one), one manifest, five tables.
+  // One log (the live one), one manifest, three tables.
   ASSERT_EQ(1u, LogFiles().size());
   ASSERT_EQ(1u, FilesOfType(FileType::kDescriptorFile).size());
-  ASSERT_EQ(5u, FilesOfType(FileType::kTableFile).size());
+  ASSERT_EQ(3u, FilesOfType(FileType::kTableFile).size());
 
   // A stray table no version refers to is cleaned up on open.
   Close();
   WriteFile(TableFileName(dbname_, 999999), "not a table, and nobody's table");
   Reopen();
   ASSERT_FALSE(std::filesystem::exists(TableFileName(dbname_, 999999)));
-  ASSERT_EQ(5u, FilesOfType(FileType::kTableFile).size());
+  ASSERT_EQ(3u, FilesOfType(FileType::kTableFile).size());
 }
 
 TEST_F(DBTest, MissingTableFailsOpen) {
@@ -615,6 +664,314 @@ TEST_F(DBTest, SequenceNumbersSurviveWhenEveryLogIsGone) {
   ASSERT_EQ("new", Get("k"));
   Reopen();
   ASSERT_EQ("new", Get("k"));
+}
+
+// --- Compaction ---
+
+TEST_F(DBTest, FourLevelZeroFilesAreCompactedIntoLevelOne) {
+  // Overlapping key ranges, so the files have to be merged, not moved.
+  for (int round = 0; round < config::kL0_CompactionTrigger; round++) {
+    for (int i = 0; i < 100; i++) {
+      ASSERT_OK(Put("key" + std::to_string(i), "round" + std::to_string(round)));
+    }
+    Flush();
+  }
+  WaitForBackground();
+  ASSERT_EQ(0, NumFilesAtLevel(0));
+  ASSERT_EQ(1, NumFilesAtLevel(1));
+  for (int i = 0; i < 100; i++) ASSERT_EQ("round3", Get("key" + std::to_string(i)));
+
+  // The inputs are gone from disk.
+  ASSERT_EQ(1u, FilesOfType(FileType::kTableFile).size());
+  Reopen();
+  ASSERT_EQ("0,1", FilesPerLevel());
+  for (int i = 0; i < 100; i++) ASSERT_EQ("round3", Get("key" + std::to_string(i)));
+}
+
+TEST_F(DBTest, NonOverlappingFileMovesDownWithoutBeingRewritten) {
+  for (int round = 0; round < config::kL0_CompactionTrigger; round++) {
+    ASSERT_OK(Put("key" + std::to_string(round), "v"));  // disjoint ranges
+    Flush();
+  }
+  const std::vector<std::string> before = FilesOfType(FileType::kTableFile);
+  WaitForBackground();
+  // One file was moved to level 1, which brings level 0 under its trigger.
+  ASSERT_EQ("3,1", FilesPerLevel());
+  ASSERT_EQ(before, FilesOfType(FileType::kTableFile));  // same files, none rewritten
+  for (int round = 0; round < config::kL0_CompactionTrigger; round++) {
+    ASSERT_EQ("v", Get("key" + std::to_string(round)));
+  }
+}
+
+TEST_F(DBTest, CompactionDropsOverwrittenVersions) {
+  const std::string value(1000, 'x');
+  for (int round = 0; round < 3; round++) {
+    for (int i = 0; i < 100; i++) ASSERT_OK(Put("key" + std::to_string(i), value));
+    Flush();
+  }
+  const uint64_t before = TotalTableBytes();
+  ASSERT_OK(db_->CompactRange(nullptr, nullptr));
+  // Three copies of every key went in; one came out.
+  ASSERT_LT(TotalTableBytes(), before / 2);
+  ASSERT_GT(TotalTableBytes(), before / 4);
+  for (int i = 0; i < 100; i++) ASSERT_EQ(value, Get("key" + std::to_string(i)));
+}
+
+TEST_F(DBTest, CompactingToTheBottomDropsDeletedKeysEntirely) {
+  for (int i = 0; i < 100; i++) ASSERT_OK(Put("key" + std::to_string(i), "v"));
+  Flush();
+  for (int i = 0; i < 100; i++) ASSERT_OK(Delete("key" + std::to_string(i)));
+  Flush();
+  ASSERT_OK(db_->CompactRange(nullptr, nullptr));
+  // Values and tombstones cancelled out: nothing is left to store.
+  ASSERT_EQ("", FilesPerLevel());
+  ASSERT_EQ(0u, FilesOfType(FileType::kTableFile).size());
+  for (int i = 0; i < 100; i++) ASSERT_EQ("NOT_FOUND", Get("key" + std::to_string(i)));
+}
+
+// The resurrection bug: a tombstone is compacted away while an older value
+// for its key still sits in a deeper level, and the deleted key comes back.
+TEST_F(DBTest, TombstoneIsKeptWhileADeeperLevelHoldsTheKey) {
+  // Put the value two levels down.
+  ASSERT_OK(Put("doomed", "v1"));
+  ASSERT_OK(Put("bystander", "b1"));
+  Flush();
+  CompactLevel(0);
+  CompactLevel(1);
+  ASSERT_EQ("0,0,1", FilesPerLevel());
+
+  // Delete it; the tombstone is in level 0.
+  ASSERT_OK(Delete("doomed"));
+  Flush();
+  ASSERT_EQ("1,0,1", FilesPerLevel());
+  ASSERT_EQ("NOT_FOUND", Get("doomed"));
+
+  // Compact the tombstone into level 1. Level 1 holds nothing for the key,
+  // so a compaction that looked only at its own inputs would conclude the
+  // tombstone hides nothing and drop it. Level 2 still has "v1".
+  CompactLevel(0);
+  ASSERT_EQ("0,1,1", FilesPerLevel());
+  ASSERT_EQ("NOT_FOUND", Get("doomed"));
+  ASSERT_EQ("b1", Get("bystander"));
+
+  Reopen();
+  ASSERT_EQ("NOT_FOUND", Get("doomed"));
+
+  // Now the tombstone meets the value. With nothing below, both go.
+  CompactLevel(1);
+  ASSERT_EQ("0,0,1", FilesPerLevel());
+  ASSERT_EQ("NOT_FOUND", Get("doomed"));
+  ASSERT_EQ("b1", Get("bystander"));
+  Reopen();
+  ASSERT_EQ("NOT_FOUND", Get("doomed"));
+  ASSERT_EQ("b1", Get("bystander"));
+}
+
+TEST_F(DBTest, DeleteThenRewriteAcrossLevelsReadsTheNewestAtEveryStage) {
+  ASSERT_OK(Put("k", "v1"));
+  Flush();
+  CompactLevel(0);
+  CompactLevel(1);  // v1 in level 2
+
+  ASSERT_OK(Delete("k"));
+  Flush();
+  CompactLevel(0);  // tombstone in level 1
+  ASSERT_EQ("NOT_FOUND", Get("k"));
+
+  ASSERT_OK(Put("k", "v2"));
+  Flush();  // v2 in level 0
+  ASSERT_EQ("1,1,1", FilesPerLevel());
+  ASSERT_EQ("v2", Get("k"));
+
+  CompactLevel(0);  // v2 over the tombstone
+  ASSERT_EQ("v2", Get("k"));
+  CompactLevel(1);  // over v1
+  ASSERT_EQ("0,0,1", FilesPerLevel());
+  ASSERT_EQ("v2", Get("k"));
+}
+
+TEST_F(DBTest, CompactRangeWithBoundsLeavesTheRestAlone) {
+  for (const char* k : {"a", "m", "z"}) {
+    ASSERT_OK(Put(k, "v"));
+    Flush();
+  }
+  ASSERT_EQ("3", FilesPerLevel());
+  const Slice begin = "l", end = "n";
+  ASSERT_OK(db_->CompactRange(&begin, &end));
+  ASSERT_EQ("2,1", FilesPerLevel());  // only the file holding "m" moved
+  for (const char* k : {"a", "m", "z"}) ASSERT_EQ("v", Get(k));
+}
+
+TEST_F(DBTest, Properties) {
+  ASSERT_EQ("0", Property("lsm.num-files-at-level0"));
+  ASSERT_OK(Put("k", "v"));
+  Flush();
+  ASSERT_EQ("1", Property("lsm.num-files-at-level0"));
+  ASSERT_EQ("0", Property("lsm.num-files-at-level6"));
+  ASSERT_NE(std::string::npos, Property("lsm.levels").find("level 0: 1 files"));
+  ASSERT_EQ("0", Property("lsm.stall-count"));
+  ASSERT_EQ("0", Property("lsm.stall-micros"));
+
+  for (const char* bad : {"lsm.num-files-at-level7", "lsm.num-files-at-level", "nonsense",
+                          "lsm.num-files-at-level1x", "lsm.num-files-at-level-1", ""}) {
+    ASSERT_EQ("(unknown property)", Property(bad)) << bad;
+  }
+}
+
+TEST_F(DBTest, WritersStallWhenTheBackgroundThreadFallsBehind) {
+  Close();
+  options_.write_buffer_size = 4 << 10;
+  options_.env = &no_sync_env_;
+  Reopen();
+  // Every write fills the memtable, and it has to be written to a table
+  // before the next one can be; writers cannot avoid waiting. (4 KiB is
+  // also smaller than a memtable's first arena block, which once made an
+  // empty memtable look full.)
+  const std::string value(1000, 'x');
+  for (int i = 0; i < 500; i++) ASSERT_OK(Put("key" + std::to_string(i % 50), value));
+  ASSERT_GT(std::stoull(Property("lsm.stall-count")), 0u);
+  ASSERT_GT(std::stoull(Property("lsm.stall-micros")), 0u);
+  for (int i = 0; i < 50; i++) ASSERT_EQ(value, Get("key" + std::to_string(i)));
+}
+
+// Small buffers, small tables, and small level targets, so that a few
+// megabytes of writes spread across several levels.
+class DBCompactionTest : public DBTest {
+ protected:
+  DBCompactionTest() {
+    Close();
+    options_.write_buffer_size = 16 << 10;
+    options_.max_file_size = 16 << 10;
+    options_.max_bytes_for_level_base = 64 << 10;
+    options_.level_size_multiplier = 4;
+    options_.env = &no_sync_env_;
+    Reopen();
+  }
+
+  void VerifyAgainst(const std::map<std::string, std::string>& model, int key_space) {
+    for (int k = 0; k < key_space; k++) {
+      const std::string key = Key(k);
+      auto it = model.find(key);
+      ASSERT_EQ(it == model.end() ? "NOT_FOUND" : it->second, Get(key)) << key;
+    }
+  }
+
+  static std::string Key(int k) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "key%06d", k);
+    return buf;
+  }
+};
+
+TEST_F(DBCompactionTest, RandomWritesSpreadAcrossLevelsAndStayReadable) {
+  constexpr int kKeySpace = 2000;
+  std::mt19937 rnd(301);
+  std::map<std::string, std::string> model;
+  for (int i = 0; i < 12000; i++) {
+    const std::string key = Key(rnd() % kKeySpace);
+    if (rnd() % 5 == 0) {
+      ASSERT_OK(Delete(key));
+      model.erase(key);
+    } else {
+      const std::string value = std::to_string(i) + std::string(100 + rnd() % 300, 'v');
+      ASSERT_OK(Put(key, value));
+      model[key] = value;
+    }
+  }
+  WaitForBackground();
+  ASSERT_OK(impl()->TEST_CheckInvariants());
+  ASSERT_GT(NumFilesAtLevel(2) + NumFilesAtLevel(3), 0) << Property("lsm.levels");
+  VerifyAgainst(model, kKeySpace);
+
+  // Every table on disk belongs to the current version: compaction inputs
+  // have been deleted.
+  ASSERT_EQ(static_cast<size_t>(TotalTableFiles()), FilesOfType(FileType::kTableFile).size());
+
+  Reopen();
+  ASSERT_OK(impl()->TEST_CheckInvariants());
+  VerifyAgainst(model, kKeySpace);
+
+  ASSERT_OK(db_->CompactRange(nullptr, nullptr));
+  ASSERT_OK(impl()->TEST_CheckInvariants());
+  VerifyAgainst(model, kKeySpace);
+}
+
+TEST_F(DBCompactionTest, ReadersSeeConsistentDataDuringMultiLevelCompaction) {
+  constexpr int kKeys = 300;
+  std::atomic<int> published{0};
+  std::atomic<bool> done{false};
+  std::atomic<int> failures{0};
+  auto value = [](int version) { return std::to_string(version) + std::string(400, 'v'); };
+
+  std::vector<std::thread> readers;
+  for (int r = 0; r < 4; r++) {
+    readers.emplace_back([&, r] {
+      std::mt19937 rnd(r);
+      while (!done.load()) {
+        const int floor = published.load();
+        std::string result;
+        Status s = db_->Get(ReadOptions(), Key(rnd() % kKeys), &result);
+        if (floor == 0 && s.IsNotFound()) continue;
+        // A reader must never see an older version than one already
+        // published, wherever compaction has moved the key meanwhile.
+        if (!s.ok() || std::stoi(result) < floor) failures++;
+      }
+    });
+  }
+  for (int version = 1; version <= 40; version++) {
+    for (int k = 0; k < kKeys; k++) ASSERT_OK(Put(Key(k), value(version)));
+    published.store(version);
+  }
+  done.store(true);
+  for (std::thread& t : readers) t.join();
+  ASSERT_EQ(0, failures.load());
+
+  WaitForBackground();
+  ASSERT_OK(impl()->TEST_CheckInvariants());
+  for (int k = 0; k < kKeys; k++) ASSERT_EQ(value(40), Get(Key(k)));
+}
+
+TEST_F(DBCompactionTest, OperationsAgainstAModelWithFlushesCompactionsAndRestarts) {
+  constexpr int kKeySpace = 300;
+  for (uint32_t seed = 0; seed < 5; seed++) {
+    SCOPED_TRACE("seed " + std::to_string(seed));
+    Close();
+    std::filesystem::remove_all(dbname_);
+    Reopen();
+    std::mt19937 rnd(seed);
+    std::map<std::string, std::string> model;
+
+    for (int step = 0; step < 3000; step++) {
+      const uint32_t op = rnd() % 1000;
+      const std::string key = Key(rnd() % kKeySpace);
+      if (op < 600) {
+        const std::string value = std::to_string(step) + std::string(rnd() % 200, 'v');
+        ASSERT_OK(Put(key, value));
+        model[key] = value;
+      } else if (op < 850) {
+        ASSERT_OK(Delete(key));
+        model.erase(key);
+      } else if (op < 970) {
+        ASSERT_EQ(model.count(key) ? model[key] : "NOT_FOUND", Get(key));
+      } else if (op < 980) {
+        Flush();
+      } else if (op < 990) {
+        const std::string a = Key(rnd() % kKeySpace), b = Key(rnd() % kKeySpace);
+        const Slice begin = std::min(a, b), end = std::max(a, b);
+        ASSERT_OK(db_->CompactRange(&begin, &end));
+      } else if (op < 995) {
+        ASSERT_OK(db_->CompactRange(nullptr, nullptr));
+      } else {
+        Reopen();
+      }
+      if (step % 500 == 499) {
+        VerifyAgainst(model, kKeySpace);
+        ASSERT_OK(impl()->TEST_CheckInvariants());
+      }
+      if (HasFatalFailure()) return;
+    }
+    VerifyAgainst(model, kKeySpace);
+  }
 }
 
 }  // namespace lsm

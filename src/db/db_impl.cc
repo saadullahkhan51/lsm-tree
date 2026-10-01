@@ -1,13 +1,19 @@
 #include "db/db_impl.h"
 
 #include <algorithm>
+#include <charconv>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "db/builder.h"
+#include "db/compaction_check.h"
 #include "db/filename.h"
 #include "db/log_reader.h"
 #include "db/memtable.h"
 #include "db/write_batch_internal.h"
+#include "table/table_builder.h"
 
 namespace lsm {
 
@@ -30,6 +36,46 @@ TableOptions MakeTableOptions(const Options& options, const InternalKeyComparato
 
 }  // namespace
 
+// A request to compact one level's files in a key range, handed to the
+// background thread.
+struct DBImpl::ManualCompaction {
+  int level;
+  bool done = false;
+  bool in_progress = false;  // the background thread is working on it
+  const InternalKey* begin;  // null means the beginning of the key range
+  const InternalKey* end;    // null means the end of the key range
+  InternalKey tmp_storage;   // where the background thread keeps its progress
+};
+
+// The state of a compaction in progress.
+struct DBImpl::CompactionState {
+  // A table being produced.
+  struct Output {
+    uint64_t number;
+    uint64_t file_size;
+    InternalKey smallest, largest;
+  };
+
+  explicit CompactionState(Compaction* c) : compaction(c) {}
+
+  Output* current_output() { return &outputs.back(); }
+
+  Compaction* const compaction;
+
+  // Entries at or below this sequence are visible to no snapshot once a
+  // newer entry for the same key exists, and may be dropped.
+  SequenceNumber smallest_snapshot = 0;
+  // Sequence numbers readers may still read at: every live snapshot, and
+  // kMaxSequenceNumber for the latest state. For the debug check.
+  std::vector<SequenceNumber> read_points;
+
+  std::vector<Output> outputs;
+
+  // The output being written, if any.
+  std::unique_ptr<WritableFile> outfile;
+  std::unique_ptr<TableBuilder> builder;
+};
+
 // One call to Write, waiting in the queue.
 struct DBImpl::Writer {
   WriteBatch* batch;  // null for a request that only forces a memtable switch
@@ -48,7 +94,7 @@ DBImpl::DBImpl(const Options& options, const std::string& dbname)
       table_options_(MakeTableOptions(options, &internal_comparator_, &block_cache_)),
       table_cache_(dbname, table_options_, env_,
                    std::max(options.max_open_files - kNumNonTableCacheFiles, 16)),
-      versions_(dbname, env_, &table_cache_, &internal_comparator_) {}
+      versions_(dbname, &options_, &table_cache_, &internal_comparator_) {}
 
 DBImpl::~DBImpl() {
   {
@@ -278,15 +324,294 @@ void DBImpl::RecordBackgroundError(const Status& s) {
 
 void DBImpl::MaybeScheduleCompaction() { bg_work_cv_.notify_one(); }
 
+bool DBImpl::HasBackgroundWork() const {
+  return imm_ != nullptr || manual_compaction_ != nullptr || versions_.NeedsCompaction();
+}
+
 void DBImpl::BackgroundThread() {
   Lock lock(mutex_);
   while (true) {
+    // After an error nothing more is attempted: the on-disk state can no
+    // longer be reasoned about until the database is reopened.
     bg_work_cv_.wait(lock,
-                     [this] { return shutting_down_ || (bg_error_.ok() && imm_ != nullptr); });
+                     [this] { return shutting_down_ || (bg_error_.ok() && HasBackgroundWork()); });
     if (shutting_down_) break;
-    CompactMemTable(&lock);
+    BackgroundCompaction(&lock);
     bg_finished_cv_.notify_all();
   }
+}
+
+SequenceNumber DBImpl::SmallestSnapshot() const { return versions_.LastSequence(); }
+
+void DBImpl::BackgroundCompaction(Lock* lock) {
+  if (imm_ != nullptr) {
+    CompactMemTable(lock);
+    return;
+  }
+
+  ManualCompaction* const m = manual_compaction_;
+  const bool is_manual = m != nullptr;
+  std::unique_ptr<Compaction> c;
+  InternalKey manual_end;
+  if (is_manual) {
+    m->in_progress = true;
+    c.reset(versions_.CompactRange(m->level, m->begin, m->end));
+    m->done = c == nullptr;
+    if (c != nullptr) {
+      manual_end = c->input(0, c->num_input_files(0) - 1)->largest;
+    }
+  } else {
+    c.reset(versions_.PickCompaction());
+  }
+
+  Status status;
+  if (c == nullptr) {
+    // Nothing to do.
+  } else if (!is_manual && c->IsTrivialMove()) {
+    // The file overlaps nothing in the next level: move it down by editing
+    // the manifest, without rewriting it. (A manual compaction rewrites
+    // anyway, to shed overwritten and deleted entries.)
+    const FileMetaData* f = c->input(0, 0);
+    c->edit()->RemoveFile(c->level(), f->number);
+    c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest, f->largest);
+    status = versions_.LogAndApply(c->edit(), lock);
+  } else {
+    CompactionState compact(c.get());
+    status = DoCompactionWork(&compact, lock);
+    CleanupCompaction(&compact);
+    c->ReleaseInputs();
+    if (status.ok()) RemoveObsoleteFiles(lock);
+  }
+  c.reset();
+
+  if (!status.ok() && !shutting_down_) {
+    RecordBackgroundError(status);
+  }
+
+  if (is_manual) {
+    if (!status.ok()) m->done = true;
+    if (!m->done) {
+      // Only part of the range was compacted. Resume after it next time.
+      m->tmp_storage = manual_end;
+      m->begin = &m->tmp_storage;
+    }
+    m->in_progress = false;
+    manual_compaction_ = nullptr;
+  }
+}
+
+void DBImpl::CleanupCompaction(CompactionState* compact) {
+  if (compact->builder != nullptr) {
+    // The compaction ended mid-file.
+    compact->builder->Abandon();
+    compact->builder.reset();
+    compact->outfile.reset();
+  }
+  for (const CompactionState::Output& out : compact->outputs) {
+    pending_outputs_.erase(out.number);
+  }
+}
+
+Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
+  assert(compact->builder == nullptr);
+  uint64_t file_number;
+  {
+    Lock lock(mutex_);
+    file_number = versions_.NewFileNumber();
+    pending_outputs_.insert(file_number);
+    compact->outputs.push_back(CompactionState::Output{file_number, 0, {}, {}});
+  }
+  Status s = env_->NewWritableFile(TableFileName(dbname_, file_number), &compact->outfile);
+  if (s.ok()) {
+    compact->builder = std::make_unique<TableBuilder>(table_options_, compact->outfile.get());
+  }
+  return s;
+}
+
+Status DBImpl::FinishCompactionOutputFile(CompactionState* compact) {
+  assert(compact->builder != nullptr);
+  assert(compact->builder->NumEntries() > 0);
+  CompactionState::Output* out = compact->current_output();
+
+  Status s = compact->builder->Finish();
+  out->file_size = compact->builder->FileSize();
+  compact->builder.reset();
+
+  if (s.ok()) s = compact->outfile->Sync();
+  if (s.ok()) s = compact->outfile->Close();
+  compact->outfile.reset();
+
+  if (s.ok()) {
+    // Check that the table can be opened before the inputs it replaces are
+    // given up.
+    std::unique_ptr<Iterator> iter(
+        table_cache_.NewIterator(ReadOptions(), out->number, out->file_size));
+    s = iter->status();
+  }
+  return s;
+}
+
+Status DBImpl::InstallCompactionResults(CompactionState* compact, Lock* lock) {
+  // One edit removes every input and adds every output, so the manifest
+  // never describes a state with only part of the compaction applied.
+  Compaction* c = compact->compaction;
+  c->AddInputDeletions(c->edit());
+  for (const CompactionState::Output& out : compact->outputs) {
+    c->edit()->AddFile(c->level() + 1, out.number, out.file_size, out.smallest, out.largest);
+  }
+  return versions_.LogAndApply(c->edit(), lock);
+}
+
+Status DBImpl::DoCompactionWork(CompactionState* compact, Lock* lock) {
+  Compaction* const c = compact->compaction;
+  assert(versions_.NumLevelFiles(c->level()) > 0);
+  assert(compact->builder == nullptr);
+
+  compact->smallest_snapshot = SmallestSnapshot();
+  compact->read_points = {kMaxSequenceNumber};
+
+  std::unique_ptr<Iterator> input(versions_.MakeInputIterator(c));
+  const Comparator* ucmp = internal_comparator_.user_comparator();
+
+  // The merge runs without the mutex.
+  lock->unlock();
+
+  Status status;
+  ParsedInternalKey ikey;
+  std::string current_user_key;
+  bool has_current_user_key = false;
+  // Sequence of the previous entry seen for current_user_key, or
+  // kMaxSequenceNumber if this is the first (newest) one.
+  SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
+  // The current output should be finished at the next user key.
+  bool roll_at_next_user_key = false;
+
+  for (input->SeekToFirst(); input->Valid() && !shutting_down_; input->Next()) {
+    // A waiting memtable flush goes first: writers may be stalled on it.
+    if (has_imm_.load(std::memory_order_relaxed)) {
+      lock->lock();
+      if (imm_ != nullptr) {
+        CompactMemTable(lock);
+        bg_finished_cv_.notify_all();
+      }
+      lock->unlock();
+    }
+
+    const Slice key = input->key();
+    if (!ParseInternalKey(key, &ikey)) {
+      // The block passed its checksum, so this is a bug or memory damage.
+      // Stop: the inputs stay in place and nothing is lost.
+      status = Status::Corruption("unparseable internal key during compaction");
+      break;
+    }
+
+    const bool new_user_key =
+        !has_current_user_key || ucmp->Compare(ikey.user_key, current_user_key) != 0;
+    if (new_user_key) {
+      current_user_key.assign(ikey.user_key);
+      has_current_user_key = true;
+      last_sequence_for_key = kMaxSequenceNumber;
+    }
+
+    // Outputs are cut only between user keys. All versions of a key then
+    // sit in one file, which keeps files within a level disjoint by user
+    // key: a later compaction that picks one file can never leave an older
+    // version of the same key behind in its neighbor.
+    if (c->ShouldStopBefore(key)) roll_at_next_user_key = true;
+    if (new_user_key && roll_at_next_user_key) {
+      if (compact->builder != nullptr) {
+        status = FinishCompactionOutputFile(compact);
+        if (!status.ok()) break;
+      }
+      roll_at_next_user_key = false;
+    }
+
+    bool drop = false;
+    if (last_sequence_for_key <= compact->smallest_snapshot) {
+      // A newer entry for this key is visible to every reader, so no one
+      // can see this one.
+      drop = true;
+    } else if (ikey.type == kTypeDeletion && ikey.sequence <= compact->smallest_snapshot &&
+               c->IsBaseLevelForKey(ikey.user_key)) {
+      // A tombstone with nothing left to hide: no reader can see past it to
+      // an older value (the first test), and no deeper level holds one (the
+      // second). Older entries for the key in this compaction's own inputs
+      // are dropped by the rule above on the next iterations. Without the
+      // second test, a value in a deeper level would come back to life.
+      drop = true;
+    }
+    last_sequence_for_key = ikey.sequence;
+
+    if (drop) continue;
+
+    if (compact->builder == nullptr) {
+      status = OpenCompactionOutputFile(compact);
+      if (!status.ok()) break;
+    }
+    if (compact->builder->NumEntries() == 0) {
+      compact->current_output()->smallest.DecodeFrom(key);
+    }
+    compact->current_output()->largest.DecodeFrom(key);
+    compact->builder->Add(key, input->value());
+    if (compact->builder->FileSize() >= c->MaxOutputFileSize()) {
+      roll_at_next_user_key = true;
+    }
+  }
+
+  if (status.ok() && shutting_down_) {
+    status = Status::IOError("database closed during compaction");
+  }
+  if (status.ok() && compact->builder != nullptr) {
+    status = compact->builder->status();
+    if (status.ok()) status = FinishCompactionOutputFile(compact);
+  }
+  if (status.ok()) status = input->status();
+  input.reset();
+
+#ifndef NDEBUG
+  if (status.ok()) {
+    status = CheckCompaction(compact);
+    if (!status.ok()) {
+      std::fprintf(stderr, "compaction invariant violated: %s\n", status.ToString().c_str());
+      std::abort();
+    }
+  }
+#endif
+
+  lock->lock();
+  if (status.ok()) {
+    status = InstallCompactionResults(compact, lock);
+  }
+  return status;
+}
+
+Status DBImpl::CheckCompaction(CompactionState* compact) {
+  Compaction* const c = compact->compaction;
+  ReadOptions options;
+  options.fill_cache = false;
+
+  std::vector<FileMetaData> metas(compact->outputs.size());
+  std::vector<FileMetaData*> output_files;
+  for (size_t i = 0; i < metas.size(); i++) {
+    metas[i].number = compact->outputs[i].number;
+    metas[i].file_size = compact->outputs[i].file_size;
+    metas[i].smallest = compact->outputs[i].smallest;
+    metas[i].largest = compact->outputs[i].largest;
+    output_files.push_back(&metas[i]);
+  }
+
+  std::unique_ptr<Iterator> input(versions_.MakeInputIterator(c));
+  std::unique_ptr<Iterator> output(versions_.NewConcatenatingIterator(options, &output_files));
+  // Asked of the version the compaction read from, independently of the
+  // bookkeeping the compaction itself used to decide.
+  auto key_may_exist_below = [c](Slice user_key) {
+    for (int level = c->level() + 2; level < config::kNumLevels; level++) {
+      if (c->input_version()->OverlapInLevel(level, &user_key, &user_key)) return true;
+    }
+    return false;
+  };
+  return CheckCompactionOutput(internal_comparator_.user_comparator(), input.get(), output.get(),
+                               compact->read_points, key_may_exist_below);
 }
 
 void DBImpl::CompactMemTable(Lock* lock) {
@@ -303,6 +628,7 @@ void DBImpl::CompactMemTable(Lock* lock) {
   if (s.ok()) {
     imm_->Unref();
     imm_ = nullptr;
+    has_imm_.store(false, std::memory_order_relaxed);
     RemoveObsoleteFiles(lock);
   } else {
     RecordBackgroundError(s);
@@ -509,17 +835,53 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
 
 Status DBImpl::MakeRoomForWrite(Lock* lock, bool force) {
   assert(!writers_.empty());
+  using Clock = std::chrono::steady_clock;
+  bool allow_delay = !force;
+  bool stalled = false;
+  // Runs wait() and charges the time to the stall counters.
+  auto stall = [&](auto wait) {
+    const Clock::time_point start = Clock::now();
+    wait();
+    stall_micros_ +=
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count();
+    if (!stalled) stall_count_++;
+    stalled = true;
+  };
+
   while (true) {
     if (!bg_error_.ok()) {
       return bg_error_;
     }
-    if (!force && mem_->ApproximateMemoryUsage() <= options_.write_buffer_size) {
+    if (allow_delay && versions_.NumLevelFiles(0) >= config::kL0_SlowdownWritesTrigger) {
+      // Level 0 is filling faster than it is compacted. Rather than let it
+      // reach the hard limit and stop a write for seconds, slow every write
+      // down by a millisecond, which also frees CPU for the compaction.
+      // Once per write at most.
+      stall([&] {
+        lock->unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        lock->lock();
+      });
+      allow_delay = false;
+      continue;
+    }
+    // An empty memtable is never switched out for being full. Its arena
+    // already holds a block, so with a write buffer smaller than that it
+    // would look full forever.
+    if (!force &&
+        (mem_->ApproximateMemoryUsage() <= options_.write_buffer_size || mem_->empty())) {
       return Status::OK();  // there is room
     }
     if (imm_ != nullptr) {
       // The previous memtable is still being flushed, and only one may be
       // pending. Wait for it.
-      bg_finished_cv_.wait(*lock);
+      stall([&] { bg_finished_cv_.wait(*lock); });
+      continue;
+    }
+    if (versions_.NumLevelFiles(0) >= config::kL0_StopWritesTrigger) {
+      // Too many level-0 files: switching memtables would add another.
+      // Wait for compaction.
+      stall([&] { bg_finished_cv_.wait(*lock); });
       continue;
     }
     Status s = SwitchMemTable(lock);
@@ -558,10 +920,103 @@ Status DBImpl::SwitchMemTable(Lock* lock) {
   logfile_number_ = new_log_number;
   log_ = std::make_unique<log::Writer>(logfile_.get());
   imm_ = mem_;
+  has_imm_.store(true, std::memory_order_relaxed);
   mem_ = new MemTable(internal_comparator_);
   mem_->Ref();
   MaybeScheduleCompaction();
   return Status::OK();
+}
+
+// ---------------------------------------------------- Manual compaction
+
+Status DBImpl::CompactRange(const Slice* begin, const Slice* end) {
+  // The deepest level that holds any of the range decides how far down the
+  // range has to be pushed.
+  int max_level_with_files = 1;
+  {
+    Lock lock(mutex_);
+    const Version* base = versions_.current();
+    for (int level = 1; level < config::kNumLevels; level++) {
+      if (base->OverlapInLevel(level, begin, end)) max_level_with_files = level;
+    }
+  }
+  Status s = TEST_FlushMemTable();  // include what is still in memory
+  for (int level = 0; level < max_level_with_files && s.ok(); level++) {
+    s = TEST_CompactRange(level, begin, end);
+  }
+  return s;
+}
+
+Status DBImpl::TEST_CompactRange(int level, const Slice* begin, const Slice* end) {
+  assert(level >= 0 && level + 1 < config::kNumLevels);
+
+  // Bounds that sort before and after every entry for the given user keys.
+  InternalKey begin_storage, end_storage;
+  ManualCompaction manual;
+  manual.level = level;
+  manual.begin = nullptr;
+  manual.end = nullptr;
+  if (begin != nullptr) {
+    begin_storage = InternalKey(*begin, kMaxSequenceNumber, kValueTypeForSeek);
+    manual.begin = &begin_storage;
+  }
+  if (end != nullptr) {
+    end_storage = InternalKey(*end, 0, kTypeDeletion);
+    manual.end = &end_storage;
+  }
+
+  Lock lock(mutex_);
+  while (!manual.done && !shutting_down_ && bg_error_.ok()) {
+    if (manual_compaction_ == nullptr) {
+      // The background thread is free to take it.
+      manual_compaction_ = &manual;
+      MaybeScheduleCompaction();
+    } else {
+      // It is running this compaction, or someone else's.
+      bg_finished_cv_.wait(lock);
+    }
+  }
+  // The background thread may still be using `manual`, which lives on this
+  // stack frame.
+  bg_finished_cv_.wait(lock, [&] { return !manual.in_progress; });
+  if (manual_compaction_ == &manual) manual_compaction_ = nullptr;
+  return bg_error_;
+}
+
+bool DBImpl::GetProperty(const Slice& property, std::string* value) {
+  value->clear();
+  Lock lock(mutex_);
+
+  static constexpr Slice kNumFilesPrefix = "lsm.num-files-at-level";
+  if (property.starts_with(kNumFilesPrefix)) {
+    const Slice digits = property.substr(kNumFilesPrefix.size());
+    int level = 0;
+    const auto [end, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), level);
+    if (ec != std::errc() || end != digits.data() + digits.size() || digits.empty() ||
+        level < 0 || level >= config::kNumLevels) {
+      return false;
+    }
+    *value = std::to_string(versions_.NumLevelFiles(level));
+    return true;
+  }
+  if (property == "lsm.stall-micros") {
+    *value = std::to_string(stall_micros_);
+    return true;
+  }
+  if (property == "lsm.stall-count") {
+    *value = std::to_string(stall_count_);
+    return true;
+  }
+  if (property == "lsm.levels") {
+    for (int level = 0; level < config::kNumLevels; level++) {
+      const int files = versions_.NumLevelFiles(level);
+      if (files == 0) continue;
+      *value += "level " + std::to_string(level) + ": " + std::to_string(files) + " files, " +
+                std::to_string(versions_.NumLevelBytes(level)) + " bytes\n";
+    }
+    return true;
+  }
+  return false;
 }
 
 // ----------------------------------------------------------- Test hooks
@@ -585,6 +1040,17 @@ int DBImpl::TEST_NumFilesAtLevel(int level) {
 Status DBImpl::TEST_CheckInvariants() {
   Lock lock(mutex_);
   return versions_.current()->CheckInvariants();
+}
+
+Status DBImpl::TEST_WaitForBackgroundWork() {
+  Lock lock(mutex_);
+  bg_finished_cv_.wait(lock, [this] { return !bg_error_.ok() || !HasBackgroundWork(); });
+  return bg_error_;
+}
+
+uint64_t DBImpl::TEST_NumBytesAtLevel(int level) {
+  Lock lock(mutex_);
+  return versions_.NumLevelBytes(level);
 }
 
 }  // namespace lsm

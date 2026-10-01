@@ -115,10 +115,13 @@ TEST_F(CrashTest, WithTheDirectorySyncReopenedDatabaseSurvives) {
   for (int i = 0; i < 20; i++) ASSERT_TRUE(Has(i)) << i;
 }
 
-// A crash while flushes are running: tables being written, the manifest
-// being appended to, logs being retired.
-TEST_F(CrashTest, SyncedWritesSurviveACrashDuringFlushes) {
+// A crash while flushes and compactions are running: tables being written
+// and deleted, the manifest being appended to, logs being retired.
+TEST_F(CrashTest, SyncedWritesSurviveACrashDuringFlushesAndCompactions) {
   options_.write_buffer_size = 16 << 10;
+  options_.max_file_size = 16 << 10;
+  options_.max_bytes_for_level_base = 64 << 10;
+  options_.level_size_multiplier = 4;
   for (uint32_t seed = 0; seed < 10; seed++) {
     SCOPED_TRACE("seed " + std::to_string(seed));
     std::mt19937 rnd(seed);
@@ -140,8 +143,12 @@ TEST_F(CrashTest, SyncedWritesSurviveACrashDuringFlushes) {
 // least as long as the last synced write; the database then carries on from
 // there.
 TEST_F(CrashTest, RepeatedTornCrashesRecoverAPrefixEveryTime) {
-  // Small enough that most generations flush, some more than once.
+  // Small enough that most generations flush, some more than once, and
+  // that the tables pile up into compactions.
   options_.write_buffer_size = 32 << 10;
+  options_.max_file_size = 32 << 10;
+  options_.max_bytes_for_level_base = 128 << 10;
+  options_.level_size_multiplier = 4;
   for (uint32_t seed = 0; seed < 20; seed++) {
     SCOPED_TRACE("seed " + std::to_string(seed));
     std::mt19937 rnd(seed);
