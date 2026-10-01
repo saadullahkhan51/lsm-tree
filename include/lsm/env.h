@@ -85,4 +85,44 @@ class Env {
   virtual Status UnlockFile(FileLock* lock) = 0;
 };
 
+// Forwards every call to another Env. Subclass it to override a few.
+class EnvWrapper : public Env {
+ public:
+  // target must outlive the wrapper.
+  explicit EnvWrapper(Env* target) : target_(target) {}
+
+  Env* target() const { return target_; }
+
+  Status NewSequentialFile(const std::string& f, std::unique_ptr<SequentialFile>* r) override {
+    return target_->NewSequentialFile(f, r);
+  }
+  Status NewRandomAccessFile(const std::string& f, std::unique_ptr<RandomAccessFile>* r) override {
+    return target_->NewRandomAccessFile(f, r);
+  }
+  Status NewWritableFile(const std::string& f, std::unique_ptr<WritableFile>* r) override {
+    return target_->NewWritableFile(f, r);
+  }
+  bool FileExists(const std::string& f) override { return target_->FileExists(f); }
+  Status GetChildren(const std::string& dir, std::vector<std::string>* r) override {
+    return target_->GetChildren(dir, r);
+  }
+  Status RemoveFile(const std::string& f) override { return target_->RemoveFile(f); }
+  Status CreateDir(const std::string& d) override { return target_->CreateDir(d); }
+  Status RemoveDir(const std::string& d) override { return target_->RemoveDir(d); }
+  Status GetFileSize(const std::string& f, uint64_t* size) override {
+    return target_->GetFileSize(f, size);
+  }
+  Status RenameFile(const std::string& src, const std::string& target) override {
+    return target_->RenameFile(src, target);
+  }
+  Status SyncDir(const std::string& dir) override { return target_->SyncDir(dir); }
+  Status LockFile(const std::string& f, FileLock** lock) override {
+    return target_->LockFile(f, lock);
+  }
+  Status UnlockFile(FileLock* lock) override { return target_->UnlockFile(lock); }
+
+ private:
+  Env* const target_;
+};
+
 }  // namespace lsm
