@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(LSM_SANITIZE "" CACHE STRING "Sanitizers to enable, e.g. address,undefined or thread")
 option(LSM_BUILD_TESTS "Build the test suite" ON)
 option(LSM_BUILD_FUZZERS "Build the libFuzzer targets in fuzz/ (needs clang)" OFF)
+option(LSM_BUILD_BENCH "Build db_bench" ON)
 option(LSM_WERROR "Treat warnings as errors" ON)
 
 if(LSM_SANITIZE)
@@ -74,4 +75,44 @@ if(LSM_BUILD_FUZZERS)
     target_link_libraries(${target}_fuzzer PRIVATE lsm)
     target_link_options(${target}_fuzzer PRIVATE -fsanitize=fuzzer)
   endforeach()
+endif()
+
+if(LSM_BUILD_BENCH)
+  add_executable(db_bench
+    bench/db_bench.cc
+    bench/engine_lsm.cc
+    bench/engine_leveldb.cc
+    bench/engine_rocksdb.cc)
+  target_compile_options(db_bench PRIVATE ${LSM_WARNINGS})
+  target_link_libraries(db_bench PRIVATE lsm)
+
+  # The comparison engines are optional: db_bench is built with whichever
+  # are installed.
+  find_path(LEVELDB_INCLUDE_DIR leveldb/db.h)
+  find_library(LEVELDB_LIBRARY leveldb)
+  if(LEVELDB_INCLUDE_DIR AND LEVELDB_LIBRARY)
+    message(STATUS "db_bench: LevelDB found at ${LEVELDB_LIBRARY}")
+    target_compile_definitions(db_bench PRIVATE LSM_BENCH_HAVE_LEVELDB)
+    target_include_directories(db_bench SYSTEM PRIVATE ${LEVELDB_INCLUDE_DIR})
+    target_link_libraries(db_bench PRIVATE ${LEVELDB_LIBRARY})
+  endif()
+  find_path(ROCKSDB_INCLUDE_DIR rocksdb/db.h)
+  find_library(ROCKSDB_LIBRARY rocksdb)
+  if(ROCKSDB_INCLUDE_DIR AND ROCKSDB_LIBRARY)
+    message(STATUS "db_bench: RocksDB found at ${ROCKSDB_LIBRARY}")
+    target_compile_definitions(db_bench PRIVATE LSM_BENCH_HAVE_ROCKSDB)
+    target_include_directories(db_bench SYSTEM PRIVATE ${ROCKSDB_INCLUDE_DIR})
+    target_link_libraries(db_bench PRIVATE ${ROCKSDB_LIBRARY})
+  endif()
+
+  include(FetchContent)
+  FetchContent_Declare(benchmark
+    URL https://github.com/google/benchmark/archive/refs/tags/v1.9.4.tar.gz)
+  set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+  set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(benchmark)
+  add_executable(micro_bench bench/micro_bench.cc)
+  target_compile_options(micro_bench PRIVATE ${LSM_WARNINGS})
+  target_link_libraries(micro_bench PRIVATE lsm benchmark::benchmark)
 endif()

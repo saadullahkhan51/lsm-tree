@@ -44,7 +44,8 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "LSM_SANITIZE": "address,undefined",
         "LSM_BUILD_FUZZERS": "ON",
-        "LSM_BUILD_TESTS": "OFF"
+        "LSM_BUILD_TESTS": "OFF",
+        "LSM_BUILD_BENCH": "OFF"
       }
     }
   ],
