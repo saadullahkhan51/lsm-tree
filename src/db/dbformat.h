@@ -10,6 +10,12 @@
 
 namespace lsm {
 
+namespace config {
+
+constexpr int kNumLevels = 7;
+
+}  // namespace config
+
 using SequenceNumber = uint64_t;
 
 // Sequence numbers are 56 bits: the low 8 bits of the trailer hold the type.
@@ -38,6 +44,9 @@ void AppendInternalKey(std::string* result, const ParsedInternalKey& key);
 
 // Returns false if internal_key is too short or carries an unknown type.
 bool ParseInternalKey(Slice internal_key, ParsedInternalKey* result);
+
+// A printable form of an internal key, for error messages and debugging.
+std::string DebugInternalKey(Slice internal_key);
 
 inline Slice ExtractUserKey(Slice internal_key) {
   assert(internal_key.size() >= 8);

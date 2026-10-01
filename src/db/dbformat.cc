@@ -18,6 +18,26 @@ bool ParseInternalKey(Slice internal_key, ParsedInternalKey* result) {
   return type <= kTypeValue;
 }
 
+std::string DebugInternalKey(Slice internal_key) {
+  ParsedInternalKey parsed;
+  if (!ParseInternalKey(internal_key, &parsed)) {
+    return "(bad internal key, " + std::to_string(internal_key.size()) + " bytes)";
+  }
+  std::string result = "'";
+  for (const char c : parsed.user_key) {
+    if (c >= ' ' && c <= '~') {
+      result.push_back(c);
+    } else {
+      static constexpr char kHex[] = "0123456789abcdef";
+      const auto byte = static_cast<uint8_t>(c);
+      result += {'\\', 'x', kHex[byte >> 4], kHex[byte & 0xf]};
+    }
+  }
+  result += "' @ " + std::to_string(parsed.sequence);
+  result += parsed.type == kTypeValue ? " : value" : " : deletion";
+  return result;
+}
+
 int InternalKeyComparator::Compare(Slice a, Slice b) const {
   int r = user_comparator_->Compare(ExtractUserKey(a), ExtractUserKey(b));
   if (r == 0) {
