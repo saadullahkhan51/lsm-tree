@@ -15,24 +15,34 @@
 
 namespace lsm::test {
 
-// An Env that models what survives power loss.
+// An Env that models what survives power loss, and can fail on demand.
 //
 // POSIX makes two separate promises. Syncing a file makes its contents
 // durable. Syncing a directory makes its entries durable: that a file was
-// created in it, or renamed within it. This Env tracks both, for every
-// file written, created, or renamed through it. SimulateCrash() then makes
-// the real files match what a disk could hold after losing power:
+// created in it, renamed within it, or removed from it. This Env tracks
+// both, for every file written, created, renamed, or removed through it.
+// SimulateCrash() then makes the real files match what a disk could hold
+// after losing power:
 //
 //   - a rename whose directory was not synced since is undone;
 //   - a file created in a directory that was not synced since is gone;
+//   - a file removed from a directory that was not synced since may be
+//     back (decided per file, at random);
 //   - every other file is cut back to its synced length, optionally keeping
 //     a random prefix of the unsynced tail (a torn write).
 //
 // Each file loses its tail independently, which also covers a filesystem
 // persisting unsynced writes to different files out of order.
 //
-// Removals take effect at once. Real fsyncs are skipped: durability is
-// simulated, and they are slow.
+// Faults it can inject while the database runs:
+//
+//   - CrashAfter(n): the filesystem dies at the (n+1)-th mutating operation
+//     from now, wherever in the engine that lands.
+//   - SetErrorRate(p): any operation, reads included, fails with
+//     probability p.
+//   - SetDropDirSyncs(true): SyncDir reports success and does nothing.
+//
+// Real fsyncs are skipped: durability is simulated, and they are slow.
 class FaultInjectionEnv : public EnvWrapper {
  public:
   explicit FaultInjectionEnv(Env* base) : EnvWrapper(base) {}
@@ -42,6 +52,37 @@ class FaultInjectionEnv : public EnvWrapper {
   void SetFilesystemActive(bool active) {
     std::lock_guard lock(mutex_);
     active_ = active;
+    crash_countdown_ = -1;
+  }
+
+  bool IsFilesystemActive() {
+    std::lock_guard lock(mutex_);
+    return active_;
+  }
+
+  // The next n mutating operations succeed; the one after fails and leaves
+  // the filesystem inactive.
+  void CrashAfter(int64_t n) {
+    std::lock_guard lock(mutex_);
+    crash_countdown_ = n;
+  }
+
+  // Mutating operations performed so far. Lets a test size CrashAfter.
+  uint64_t MutatingOps() {
+    std::lock_guard lock(mutex_);
+    return mutating_ops_;
+  }
+
+  // Each operation fails with this probability, independently. 0 disables.
+  void SetErrorRate(double rate, uint32_t seed = 0) {
+    std::lock_guard lock(mutex_);
+    error_rate_ = rate;
+    error_rng_.seed(seed);
+  }
+
+  uint64_t InjectedErrors() {
+    std::lock_guard lock(mutex_);
+    return injected_errors_;
   }
 
   // While set, SyncDir reports success without making anything durable.
@@ -52,9 +93,10 @@ class FaultInjectionEnv : public EnvWrapper {
   }
 
   // REQUIRES: no file opened through this Env is still open for writing.
-  // If torn is non-null, each file keeps a random-length prefix of its
-  // unsynced tail instead of losing all of it.
-  Status SimulateCrash(std::mt19937* torn = nullptr) {
+  // With rnd, each file keeps a random-length prefix of its unsynced tail
+  // instead of losing all of it, and each unsynced removal is undone or not
+  // at random. Without it, unsynced data is lost in full and removals stand.
+  Status SimulateCrash(std::mt19937* rnd = nullptr) {
     std::lock_guard lock(mutex_);
 
     // Undo renames, newest first.
@@ -78,13 +120,23 @@ class FaultInjectionEnv : public EnvWrapper {
     }
     created_since_dir_sync_.clear();
 
+    for (const PendingRemoval& removal : pending_removals_) {
+      const bool restore = rnd != nullptr && (*rnd)() % 2 == 0 && ::access(removal.name.c_str(), F_OK) != 0;
+      if (restore) {
+        ::rename(removal.backup.c_str(), removal.name.c_str());
+      } else {
+        ::unlink(removal.backup.c_str());
+      }
+    }
+    pending_removals_.clear();
+
     for (auto& [fname, state] : files_) {
       struct stat st;
       if (::stat(fname.c_str(), &st) != 0) continue;  // removed behind our back
       const uint64_t on_disk = static_cast<uint64_t>(st.st_size);
       uint64_t keep = state.synced;
-      if (torn != nullptr && on_disk > keep) {
-        keep += (*torn)() % (on_disk - keep + 1);
+      if (rnd != nullptr && on_disk > keep) {
+        keep += (*rnd)() % (on_disk - keep + 1);
       }
       keep = std::min(keep, on_disk);
       if (::truncate(fname.c_str(), static_cast<off_t>(keep)) != 0) {
@@ -95,9 +147,29 @@ class FaultInjectionEnv : public EnvWrapper {
     return Status::OK();
   }
 
+  Status NewSequentialFile(const std::string& fname,
+                           std::unique_ptr<SequentialFile>* result) override {
+    Status s = Intercept(fname, /*mutating=*/false);
+    if (!s.ok()) return s;
+    std::unique_ptr<SequentialFile> base;
+    s = target()->NewSequentialFile(fname, &base);
+    if (s.ok()) *result = std::make_unique<FaultySequentialFile>(this, fname, std::move(base));
+    return s;
+  }
+
+  Status NewRandomAccessFile(const std::string& fname,
+                             std::unique_ptr<RandomAccessFile>* result) override {
+    Status s = Intercept(fname, /*mutating=*/false);
+    if (!s.ok()) return s;
+    std::unique_ptr<RandomAccessFile> base;
+    s = target()->NewRandomAccessFile(fname, &base);
+    if (s.ok()) *result = std::make_unique<FaultyRandomAccessFile>(this, fname, std::move(base));
+    return s;
+  }
+
   Status NewWritableFile(const std::string& fname,
                          std::unique_ptr<WritableFile>* result) override {
-    Status s = CheckActive(fname);
+    Status s = Intercept(fname, /*mutating=*/true);
     if (!s.ok()) return s;
     std::unique_ptr<WritableFile> base;
     s = target()->NewWritableFile(fname, &base);
@@ -112,19 +184,31 @@ class FaultInjectionEnv : public EnvWrapper {
   }
 
   Status RemoveFile(const std::string& fname) override {
-    Status s = CheckActive(fname);
+    Status s = Intercept(fname, /*mutating=*/true);
     if (!s.ok()) return s;
-    s = target()->RemoveFile(fname);
+    std::lock_guard lock(mutex_);
+    if (created_since_dir_sync_.count(fname) > 0) {
+      // Never durably there, so there is nothing that could come back.
+      s = target()->RemoveFile(fname);
+      if (s.ok()) {
+        files_.erase(fname);
+        created_since_dir_sync_.erase(fname);
+      }
+      return s;
+    }
+    // Keep the file under another name until the directory is synced: the
+    // removal is not durable before that, and a crash may bring it back.
+    const std::string backup = fname + kRemovedMarker + std::to_string(next_backup_++);
+    s = target()->RenameFile(fname, backup);
     if (s.ok()) {
-      std::lock_guard lock(mutex_);
       files_.erase(fname);
-      created_since_dir_sync_.erase(fname);
+      pending_removals_.push_back({fname, backup});
     }
     return s;
   }
 
   Status RenameFile(const std::string& src, const std::string& dst) override {
-    Status s = CheckActive(src);
+    Status s = Intercept(src, /*mutating=*/true);
     if (!s.ok()) return s;
     std::lock_guard lock(mutex_);
 
@@ -132,7 +216,7 @@ class FaultInjectionEnv : public EnvWrapper {
     // rename can be undone.
     PendingRename pending{src, dst, ""};
     if (target()->FileExists(dst)) {
-      pending.backup = dst + kBackupMarker + std::to_string(next_backup_++);
+      pending.backup = dst + kRenamedOverMarker + std::to_string(next_backup_++);
       if (::link(dst.c_str(), pending.backup.c_str()) != 0) {
         return Status::IOError(dst, "could not back up rename target");
       }
@@ -148,7 +232,7 @@ class FaultInjectionEnv : public EnvWrapper {
   }
 
   Status SyncDir(const std::string& dir) override {
-    Status s = CheckActive(dir);
+    Status s = Intercept(dir, /*mutating=*/true);
     if (!s.ok()) return s;
     std::lock_guard lock(mutex_);
     if (drop_dir_syncs_) return Status::OK();
@@ -161,20 +245,28 @@ class FaultInjectionEnv : public EnvWrapper {
       if (!r.backup.empty()) ::unlink(r.backup.c_str());
       return true;
     });
+    std::erase_if(pending_removals_, [&](const PendingRemoval& r) {
+      if (!r.name.starts_with(prefix)) return false;
+      ::unlink(r.backup.c_str());
+      return true;
+    });
     return Status::OK();
   }
 
   Status GetChildren(const std::string& dir, std::vector<std::string>* result) override {
-    Status s = target()->GetChildren(dir, result);
-    // The backups of renamed-over files are bookkeeping, not directory
-    // contents.
-    std::erase_if(*result,
-                  [](const std::string& name) { return name.find(kBackupMarker) != name.npos; });
+    Status s = Intercept(dir, /*mutating=*/false);
+    if (!s.ok()) return s;
+    s = target()->GetChildren(dir, result);
+    // The backups are bookkeeping, not directory contents.
+    std::erase_if(*result, [](const std::string& name) {
+      return name.find(kRenamedOverMarker) != name.npos || name.find(kRemovedMarker) != name.npos;
+    });
     return s;
   }
 
  private:
-  static constexpr const char* kBackupMarker = ".renamed-over-";
+  static constexpr const char* kRenamedOverMarker = ".renamed-over-";
+  static constexpr const char* kRemovedMarker = ".removed-";
 
   struct FileState {
     uint64_t synced = 0;
@@ -186,30 +278,37 @@ class FaultInjectionEnv : public EnvWrapper {
     std::string backup;  // where the file dst used to name is kept; empty if none
   };
 
+  struct PendingRemoval {
+    std::string name;
+    std::string backup;  // where the removed file is kept
+  };
+
   class TrackedFile : public WritableFile {
    public:
     TrackedFile(FaultInjectionEnv* env, std::string fname, std::unique_ptr<WritableFile> base)
         : env_(env), fname_(std::move(fname)), base_(std::move(base)) {}
 
     Status Append(Slice data) override {
-      Status s = env_->CheckActive(fname_);
+      Status s = env_->Intercept(fname_, /*mutating=*/true);
       if (s.ok()) s = base_->Append(data);
       if (s.ok()) written_ += data.size();
       return s;
     }
     Status Flush() override {
-      Status s = env_->CheckActive(fname_);
+      Status s = env_->Intercept(fname_, /*mutating=*/true);
       return s.ok() ? base_->Flush() : s;
     }
     Status Sync() override {
-      Status s = Flush();  // get the bytes into the real file; skip the real fsync
+      Status s = env_->Intercept(fname_, /*mutating=*/true);
+      // Get the bytes into the real file; skip the real fsync.
+      if (s.ok()) s = base_->Flush();
       if (s.ok()) env_->RecordSync(fname_, written_);
       return s;
     }
     Status Close() override {
-      Status s = env_->CheckActive(fname_);
-      // When the filesystem is down, base_ is destroyed without a flush and
-      // whatever it had buffered is dropped, like any other unsynced data.
+      Status s = env_->Intercept(fname_, /*mutating=*/true);
+      // If this fails, base_ is destroyed without a flush and whatever it
+      // had buffered is dropped, like any other unsynced data.
       return s.ok() ? base_->Close() : s;
     }
 
@@ -220,9 +319,69 @@ class FaultInjectionEnv : public EnvWrapper {
     uint64_t written_ = 0;
   };
 
-  Status CheckActive(const std::string& context) {
+  class FaultySequentialFile : public SequentialFile {
+   public:
+    FaultySequentialFile(FaultInjectionEnv* env, std::string fname,
+                         std::unique_ptr<SequentialFile> base)
+        : env_(env), fname_(std::move(fname)), base_(std::move(base)) {}
+
+    Status Read(size_t n, Slice* result, char* scratch) override {
+      Status s = env_->Intercept(fname_, /*mutating=*/false);
+      if (!s.ok()) {
+        *result = Slice();
+        return s;
+      }
+      return base_->Read(n, result, scratch);
+    }
+    Status Skip(uint64_t n) override { return base_->Skip(n); }
+
+   private:
+    FaultInjectionEnv* const env_;
+    const std::string fname_;
+    std::unique_ptr<SequentialFile> base_;
+  };
+
+  class FaultyRandomAccessFile : public RandomAccessFile {
+   public:
+    FaultyRandomAccessFile(FaultInjectionEnv* env, std::string fname,
+                           std::unique_ptr<RandomAccessFile> base)
+        : env_(env), fname_(std::move(fname)), base_(std::move(base)) {}
+
+    Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const override {
+      Status s = env_->Intercept(fname_, /*mutating=*/false);
+      if (!s.ok()) {
+        *result = Slice();
+        return s;
+      }
+      return base_->Read(offset, n, result, scratch);
+    }
+
+   private:
+    FaultInjectionEnv* const env_;
+    const std::string fname_;
+    std::unique_ptr<RandomAccessFile> base_;
+  };
+
+  // Decides whether an operation goes ahead. Every operation passes
+  // through here.
+  Status Intercept(const std::string& context, bool mutating) {
     std::lock_guard lock(mutex_);
-    return active_ ? Status::OK() : Status::IOError(context, "simulated power loss");
+    if (mutating) {
+      if (!active_) return Status::IOError(context, "simulated power loss");
+      if (crash_countdown_ == 0) {
+        active_ = false;
+        crash_countdown_ = -1;
+        return Status::IOError(context, "simulated power loss");
+      }
+      if (crash_countdown_ > 0) crash_countdown_--;
+      mutating_ops_++;
+    }
+    if (error_rate_ > 0 &&
+        std::uniform_real_distribution<double>(0, 1)(error_rng_) < error_rate_) {
+      injected_errors_++;
+      return Status::IOError(context, "injected I/O error");
+    }
+    return Status::OK();
   }
 
   // REQUIRES: mutex_ held. The file known as from is now known as to.
@@ -247,10 +406,16 @@ class FaultInjectionEnv : public EnvWrapper {
 
   std::mutex mutex_;
   bool active_ = true;
+  int64_t crash_countdown_ = -1;  // -1: no crash scheduled
+  uint64_t mutating_ops_ = 0;
+  double error_rate_ = 0;
+  std::mt19937 error_rng_;
+  uint64_t injected_errors_ = 0;
   bool drop_dir_syncs_ = false;
   std::map<std::string, FileState> files_;
   std::set<std::string> created_since_dir_sync_;
   std::vector<PendingRename> pending_renames_;
+  std::vector<PendingRemoval> pending_removals_;
   int next_backup_ = 0;
 };
 
