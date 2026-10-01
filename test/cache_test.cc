@@ -176,12 +176,6 @@ TEST_F(CacheTest, HeavyEntries) {
   ASSERT_EQ(static_cast<size_t>(cached_weight), cache_.TotalCharge());
 }
 
-TEST_F(CacheTest, NewId) {
-  const uint64_t a = cache_.NewId();
-  const uint64_t b = cache_.NewId();
-  ASSERT_NE(a, b);
-}
-
 TEST_F(CacheTest, HitAndMissCounters) {
   Insert(1, 1);
   ASSERT_EQ(1, Lookup(1));

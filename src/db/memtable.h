@@ -4,6 +4,7 @@
 
 #include "db/dbformat.h"
 #include "db/skiplist.h"
+#include "lsm/iterator.h"
 #include "lsm/status.h"
 #include "util/arena.h"
 
@@ -40,7 +41,14 @@ class MemTable {
   // tombstone, sets *s to NotFound and returns true. Otherwise returns false.
   bool Get(const LookupKey& key, std::string* value, Status* s) const;
 
+  // An iterator over the entries, yielding internal keys. The caller must
+  // keep a reference on the memtable for as long as the iterator is live.
+  // Like Get, it may be used while a writer is adding entries.
+  Iterator* NewIterator() const;
+
  private:
+  friend class MemTableIterator;
+
   ~MemTable() { assert(refs_ == 0); }  // deleted only through Unref
 
   // Compares two entries by the internal key each one starts with.

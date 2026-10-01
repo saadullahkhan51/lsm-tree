@@ -35,9 +35,6 @@ class ShardedLRUCache {
   void* Value(Handle* handle);
   void Erase(Slice key);
 
-  // A fresh id, for clients sharing the cache to prefix their keys with.
-  uint64_t NewId() { return last_id_.fetch_add(1, std::memory_order_relaxed) + 1; }
-
   size_t TotalCharge() const;
   uint64_t hits() const { return hits_.load(std::memory_order_relaxed); }
   uint64_t misses() const { return misses_.load(std::memory_order_relaxed); }
@@ -49,7 +46,6 @@ class ShardedLRUCache {
   Shard& ShardFor(Slice key);
 
   std::unique_ptr<Shard[]> shards_;
-  std::atomic<uint64_t> last_id_{0};
   std::atomic<uint64_t> hits_{0};
   std::atomic<uint64_t> misses_{0};
 };

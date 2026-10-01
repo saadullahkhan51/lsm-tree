@@ -22,6 +22,36 @@ Slice GetLengthPrefixed(const char* data) {
 
 }  // namespace
 
+class MemTableIterator : public Iterator {
+ public:
+  explicit MemTableIterator(const MemTable::Table* table) : iter_(table) {}
+
+  bool Valid() const override { return iter_.Valid(); }
+  void Seek(Slice target) override {
+    // The skiplist holds length-prefixed keys, so the target needs the
+    // same prefix to be comparable.
+    tmp_.clear();
+    PutLengthPrefixedSlice(&tmp_, target);
+    iter_.Seek(tmp_.data());
+  }
+  void SeekToFirst() override { iter_.SeekToFirst(); }
+  void SeekToLast() override { iter_.SeekToLast(); }
+  void Next() override { iter_.Next(); }
+  void Prev() override { iter_.Prev(); }
+  Slice key() const override { return GetLengthPrefixed(iter_.key()); }
+  Slice value() const override {
+    const Slice key = GetLengthPrefixed(iter_.key());
+    return GetLengthPrefixed(key.data() + key.size());
+  }
+  Status status() const override { return Status::OK(); }
+
+ private:
+  MemTable::Table::Iterator iter_;
+  std::string tmp_;  // scratch for Seek
+};
+
+Iterator* MemTable::NewIterator() const { return new MemTableIterator(&table_); }
+
 MemTable::MemTable(const InternalKeyComparator& comparator)
     : comparator_{comparator}, table_(comparator_, &arena_) {}
 
