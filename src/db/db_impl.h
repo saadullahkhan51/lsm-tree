@@ -43,7 +43,9 @@ class DBImpl : public DB {
   Status TEST_FlushMemTable();
   // Number of table files at each level of the current version.
   int TEST_NumFilesAtLevel(int level);
-  // Checks the current version's level structure.
+  // Checks the current version's level structure, and then reads every
+  // table in it to check that its keys are in order and span exactly the
+  // range the manifest records for it.
   Status TEST_CheckInvariants();
   // Compacts the files of one level that overlap [*begin, *end] into the
   // next level. Null bounds are open.
@@ -101,7 +103,7 @@ class DBImpl : public DB {
   Status FinishCompactionOutputFile(CompactionState* compact);
   Status InstallCompactionResults(CompactionState* compact, Lock* lock);
   // Debug builds: checks the outputs against the inputs before installing.
-  Status CheckCompaction(CompactionState* compact);
+  Status CheckCompaction(CompactionState* compact, std::string* violation);
   void CleanupCompaction(CompactionState* compact);
   // Oldest sequence number any snapshot may still read at.
   SequenceNumber SmallestSnapshot() const;

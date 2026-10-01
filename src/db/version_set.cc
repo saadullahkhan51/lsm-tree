@@ -431,6 +431,8 @@ Status VersionSet::WriteSnapshot(log::Writer* log) {
 }
 
 Status VersionSet::LogAndApply(VersionEdit* edit, std::unique_lock<std::mutex>* lock) {
+  if (!manifest_error_.ok()) return manifest_error_;
+
   if (edit->has_log_number_) {
     assert(edit->log_number_ >= log_number_);
     assert(edit->log_number_ < next_file_number_);
@@ -481,11 +483,16 @@ Status VersionSet::LogAndApply(VersionEdit* edit, std::unique_lock<std::mutex>* 
     AppendVersion(v);
     log_number_ = edit->log_number_;
   } else {
+    manifest_error_ = s;
     delete v;
     if (!new_manifest_file.empty()) {
       descriptor_log_.reset();
       descriptor_file_.reset();
-      (void)env_->RemoveFile(new_manifest_file);
+      // The new manifest is left in place. If the failure came after
+      // CURRENT was renamed to point at it (the directory sync can fail),
+      // it is the live manifest, and deleting it would make the database
+      // unopenable. If CURRENT still names the old one, the next open
+      // removes this file as garbage.
     }
   }
   return s;
@@ -530,6 +537,12 @@ Status VersionSet::Recover() {
     return Status::Corruption("CURRENT file does not end with a newline");
   }
   current.pop_back();
+  uint64_t current_number;
+  FileType current_type;
+  if (!ParseFileName(current, &current_number, &current_type) ||
+      current_type != FileType::kDescriptorFile) {
+    return Status::Corruption("CURRENT does not name a manifest", current);
+  }
 
   const std::string manifest_name = dbname_ + "/" + current;
   std::unique_ptr<SequentialFile> file;

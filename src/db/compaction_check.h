@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "db/dbformat.h"
@@ -25,9 +26,12 @@ namespace lsm {
 //
 // It also checks that the output contains nothing the input did not.
 //
-// Returns Corruption describing the first difference.
+// If the two differ, *violation describes the first difference; otherwise
+// it is left empty. The return value says only whether the check could be
+// carried out: it is the error, if any, from reading the iterators.
 Status CheckCompactionOutput(const Comparator* user_comparator, Iterator* input, Iterator* output,
                              const std::vector<SequenceNumber>& read_points,
-                             const std::function<bool(Slice user_key)>& key_may_exist_below);
+                             const std::function<bool(Slice user_key)>& key_may_exist_below,
+                             std::string* violation);
 
 }  // namespace lsm

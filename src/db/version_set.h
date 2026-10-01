@@ -118,8 +118,10 @@ class VersionSet {
   // lock is held on entry and exit and released while the manifest is
   // written. REQUIRES: no other thread is in LogAndApply.
   //
-  // If this fails, the manifest may end in a partial record. The caller
-  // must not call LogAndApply again.
+  // If a manifest write fails, the manifest may end in a partial record,
+  // and anything appended after it would be unreadable. From then on every
+  // call fails with the same error without touching the file; the database
+  // has to be reopened.
   Status LogAndApply(VersionEdit* edit, std::unique_lock<std::mutex>* lock);
 
   // Writes the manifest and CURRENT for a database that has no files yet.
@@ -218,6 +220,8 @@ class VersionSet {
   // one.
   std::unique_ptr<WritableFile> descriptor_file_;
   std::unique_ptr<log::Writer> descriptor_log_;
+  // The first error from writing the manifest. Sticky.
+  Status manifest_error_;
 
   Version dummy_versions_;  // head of the circular list
   Version* current_ = nullptr;  // == dummy_versions_.prev_

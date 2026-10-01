@@ -46,8 +46,12 @@ Status Check(const std::vector<Entry>& input, const std::vector<Entry>& output,
   const EntrySet input_set(input), output_set(output);
   std::unique_ptr<Iterator> in(input_set.NewIterator());
   std::unique_ptr<Iterator> out(output_set.NewIterator());
-  return CheckCompactionOutput(BytewiseComparator(), in.get(), out.get(), read_points,
-                               [=](Slice) { return key_may_exist_below; });
+  std::string violation;
+  Status s = CheckCompactionOutput(BytewiseComparator(), in.get(), out.get(), read_points,
+                                   [=](Slice) { return key_may_exist_below; }, &violation);
+  // For these tests a violation and a failed check are both "not OK".
+  if (s.ok() && !violation.empty()) s = Status::Corruption(violation);
+  return s;
 }
 
 }  // namespace

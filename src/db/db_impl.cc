@@ -578,22 +578,29 @@ Status DBImpl::DoCompactionWork(CompactionState* compact, Lock* lock) {
 
 #ifndef NDEBUG
   if (status.ok()) {
-    status = CheckCompaction(compact);
-    if (!status.ok()) {
-      std::fprintf(stderr, "compaction invariant violated: %s\n", status.ToString().c_str());
+    // A failure to read back the files fails the compaction like any other
+    // I/O error. A difference between input and output is a bug: stop the
+    // process before the result can be installed.
+    std::string violation;
+    status = CheckCompaction(compact, &violation);
+    if (!violation.empty()) {
+      std::fprintf(stderr, "compaction invariant violated: %s\n", violation.c_str());
       std::abort();
     }
   }
 #endif
 
   lock->lock();
+  // A flush that failed while this compaction was running has already put
+  // the database into its error state.
+  if (status.ok()) status = bg_error_;
   if (status.ok()) {
     status = InstallCompactionResults(compact, lock);
   }
   return status;
 }
 
-Status DBImpl::CheckCompaction(CompactionState* compact) {
+Status DBImpl::CheckCompaction(CompactionState* compact, std::string* violation) {
   Compaction* const c = compact->compaction;
   ReadOptions options;
   options.fill_cache = false;
@@ -619,7 +626,7 @@ Status DBImpl::CheckCompaction(CompactionState* compact) {
     return false;
   };
   return CheckCompactionOutput(internal_comparator_.user_comparator(), input.get(), output.get(),
-                               compact->read_points, key_may_exist_below);
+                               compact->read_points, key_may_exist_below, violation);
 }
 
 void DBImpl::CompactMemTable(Lock* lock) {
@@ -1118,7 +1125,42 @@ int DBImpl::TEST_NumFilesAtLevel(int level) {
 
 Status DBImpl::TEST_CheckInvariants() {
   Lock lock(mutex_);
-  return versions_.current()->CheckInvariants();
+  Version* current = versions_.current();
+  Status s = current->CheckInvariants();
+  if (!s.ok()) return s;
+  current->Ref();
+  lock.unlock();
+
+  ReadOptions options;
+  options.fill_cache = false;
+  for (int level = 0; level < config::kNumLevels && s.ok(); level++) {
+    for (const FileMetaData* f : current->files(level)) {
+      const std::string where =
+          "level " + std::to_string(level) + " file " + std::to_string(f->number);
+      std::unique_ptr<Iterator> iter(table_cache_.NewIterator(options, f->number, f->file_size));
+      std::string prev;
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        if (prev.empty()) {
+          if (iter->key() != f->smallest.Encode()) {
+            s = Status::Corruption(where, "first key is not the recorded smallest key");
+          }
+        } else if (internal_comparator_.Compare(prev, iter->key()) >= 0) {
+          s = Status::Corruption(where, "keys are out of order");
+        }
+        if (!s.ok()) break;
+        prev.assign(iter->key());
+      }
+      if (s.ok()) s = iter->status();
+      if (s.ok() && prev != f->largest.Encode()) {
+        s = Status::Corruption(where, "last key is not the recorded largest key");
+      }
+      if (!s.ok()) break;
+    }
+  }
+
+  lock.lock();
+  current->Unref();
+  return s;
 }
 
 Status DBImpl::TEST_WaitForBackgroundWork() {

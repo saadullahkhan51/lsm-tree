@@ -11,6 +11,7 @@
 #include "db/filename.h"
 #include "db/log_writer.h"
 #include "db/table_cache.h"
+#include "fault_injection_env.h"
 #include "gtest/gtest.h"
 #include "testutil.h"
 
@@ -401,6 +402,46 @@ TEST_F(VersionSetTest, RecoverRejectsVersionsThatBreakTheLevelInvariants) {
     WriteManifest({level0});
     ASSERT_OK(NewVersionSet()->Recover());
   }
+}
+
+// After a manifest write fails, the file may end in a partial record.
+// Appending after it would bury the damage in the middle of the manifest,
+// where recovery cannot tell it from corruption.
+TEST_F(VersionSetTest, NothingIsAppendedToTheManifestAfterAFailedWrite) {
+  test::FaultInjectionEnv fault_env(Env::Default());
+  options_.env = &fault_env;
+  ASSERT_OK(VersionSet::CreateNew(dbname_, &fault_env, BytewiseComparator()));
+  auto vset = NewVersionSet();
+  ASSERT_OK(vset->Recover());
+
+  VersionEdit good;
+  AddFile(&good, 1, vset->NewFileNumber(), "a", "c");
+  ASSERT_OK(Apply(vset.get(), &good));
+  const std::string before = vset->current()->DebugString();
+
+  // Writing this edit's record fails partway through.
+  VersionEdit failed;
+  AddFile(&failed, 1, vset->NewFileNumber(), "d", "f");
+  fault_env.CrashAfter(3);
+  Status s = Apply(vset.get(), &failed);
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  ASSERT_EQ(before, vset->current()->DebugString());  // not installed
+
+  // The filesystem is healthy again, but the version set refuses to write.
+  fault_env.SetFilesystemActive(true);
+  VersionEdit later;
+  AddFile(&later, 1, vset->NewFileNumber(), "g", "i");
+  const std::string manifest = CurrentManifestPath();
+  const auto size_before = std::filesystem::file_size(manifest);
+  s = Apply(vset.get(), &later);
+  ASSERT_TRUE(s.IsIOError()) << s.ToString();
+  ASSERT_EQ(size_before, std::filesystem::file_size(manifest));
+  vset.reset();
+
+  // A reopen recovers: the manifest is intact up to the last complete edit.
+  auto reopened = NewVersionSet();
+  ASSERT_OK(reopened->Recover());
+  ASSERT_OK(reopened->current()->CheckInvariants());
 }
 
 // --- Choosing compactions ---
