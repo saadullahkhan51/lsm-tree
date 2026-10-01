@@ -14,6 +14,14 @@ namespace config {
 
 constexpr int kNumLevels = 7;
 
+// Level 0 is compacted once it has this many files.
+constexpr int kL0_CompactionTrigger = 4;
+// At this many level-0 files each write is delayed by 1 ms, to let
+// compaction catch up without stopping writes outright.
+constexpr int kL0_SlowdownWritesTrigger = 8;
+// At this many level-0 files writes stop until compaction reduces them.
+constexpr int kL0_StopWritesTrigger = 12;
+
 }  // namespace config
 
 using SequenceNumber = uint64_t;

@@ -25,8 +25,20 @@ struct Options {
   // 0 disables bloom filters.
   int bloom_bits_per_key = 10;
   CompressionType compression = kNoCompression;
-  // Treat any corruption found while opening as fatal.
+  // Accepted for LevelDB compatibility and has no effect: every block read
+  // is checksummed and every error found during recovery is fatal, whether
+  // or not this is set.
   bool paranoid_checks = false;
+
+  // --- Level shape. These set the write/space amplification tradeoff. ---
+
+  // Compaction starts a new output table once the current one reaches this.
+  size_t max_file_size = 2 << 20;
+  // Target total size of level 1.
+  uint64_t max_bytes_for_level_base = 10 << 20;
+  // Each level's target is this many times the one above it.
+  int level_size_multiplier = 10;
+
   const Comparator* comparator = BytewiseComparator();
   Env* env = Env::Default();
 };
