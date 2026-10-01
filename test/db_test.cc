@@ -847,6 +847,32 @@ TEST_F(DBTest, Properties) {
   ASSERT_EQ("0", Property("lsm.stall-count"));
   ASSERT_EQ("0", Property("lsm.stall-micros"));
 
+  // Byte counters and the ratios derived from them.
+  ASSERT_GT(std::stoull(Property("lsm.user-bytes-written")), 0u);
+  ASSERT_GT(std::stoull(Property("lsm.wal-bytes-written")),
+            std::stoull(Property("lsm.user-bytes-written")));
+  ASSERT_GT(std::stoull(Property("lsm.flush-bytes-written")), 0u);
+  ASSERT_EQ("0", Property("lsm.compaction-bytes-written"));
+  ASSERT_EQ(Property("lsm.flush-bytes-written"), Property("lsm.total-table-bytes"));
+  // One small write: the log copy plus a table with its index, filter,
+  // and footer dwarf the two bytes of user data.
+  ASSERT_GT(std::stod(Property("lsm.write-amplification")), 2.0);
+
+  // Reads: one that the memtable answers, one that needs the table.
+  ASSERT_EQ("v", Get("k"));
+  ASSERT_OK(Put("in-mem", "x"));
+  ASSERT_EQ("x", Get("in-mem"));
+  ASSERT_EQ("0:1 1:1 2:0 3:0 4:0 5:0 6:0 7+:0", Property("lsm.files-probed-per-get"));
+  ASSERT_EQ("1", Property("lsm.block-cache-misses"));
+  ASSERT_EQ("v", Get("k"));
+  ASSERT_EQ("1", Property("lsm.block-cache-hits"));
+
+  const std::string stats = Property("lsm.stats");
+  for (const char* expected : {"level  files", "write-amplification: ", "stall-count: 0",
+                               "files-probed-per-get: 0:1 1:2", "block-cache-hits: 1"}) {
+    ASSERT_NE(std::string::npos, stats.find(expected)) << expected << "\n" << stats;
+  }
+
   for (const char* bad : {"lsm.num-files-at-level7", "lsm.num-files-at-level", "nonsense",
                           "lsm.num-files-at-level1x", "lsm.num-files-at-level-1", ""}) {
     ASSERT_EQ("(unknown property)", Property(bad)) << bad;
@@ -1080,6 +1106,50 @@ TEST_F(DBTest, SnapshotOfATombstoneOverADeeperValue) {
   ASSERT_EQ("NOT_FOUND", GetAt(after_delete, "k"));
   ASSERT_EQ("v2", Get("k"));
   db_->ReleaseSnapshot(after_delete);
+}
+
+TEST_F(DBTest, WriteAmplificationCountsEveryRewrite) {
+  const std::string value(1000, 'x');
+  for (int round = 0; round < 3; round++) {
+    for (int i = 0; i < 100; i++) ASSERT_OK(Put("key" + std::to_string(i), value));
+    Flush();
+  }
+  ASSERT_OK(db_->CompactRange(nullptr, nullptr));
+  const double user = std::stod(Property("lsm.user-bytes-written"));
+  const double wal = std::stod(Property("lsm.wal-bytes-written"));
+  const double flush = std::stod(Property("lsm.flush-bytes-written"));
+  const double compaction = std::stod(Property("lsm.compaction-bytes-written"));
+  // Every byte went to the log once and to a level-0 table once; the
+  // compaction then rewrote one of the three copies of each key.
+  ASSERT_NEAR(1.0, wal / user, 0.05);
+  ASSERT_NEAR(1.0, flush / user, 0.05);
+  ASSERT_NEAR(1.0 / 3, compaction / user, 0.05);
+  ASSERT_NEAR((wal + flush + compaction) / user, std::stod(Property("lsm.write-amplification")),
+              0.01);
+  ASSERT_NEAR(flush, std::stod(Property("lsm.compaction-bytes-read")), 1.0);
+}
+
+TEST_F(DBTest, WithoutGroupCommitEachWriteIsItsOwnLogRecord) {
+  impl()->TEST_SetGroupCommit(false);
+  std::vector<std::thread> threads;
+  for (int t = 0; t < 8; t++) {
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < 50; i++) {
+        ASSERT_OK(db_->Put(WriteOptions(), "t" + std::to_string(t) + "-" + std::to_string(i), "v"));
+      }
+    });
+  }
+  for (std::thread& t : threads) t.join();
+  Close();
+
+  std::unique_ptr<SequentialFile> file;
+  ASSERT_OK(Env::Default()->NewSequentialFile(LogFiles()[0], &file));
+  log::Reader reader(file.get());
+  Slice record;
+  std::string scratch;
+  int records = 0;
+  while (reader.ReadRecord(&record, &scratch)) records++;
+  ASSERT_EQ(8 * 50, records);
 }
 
 // Small buffers, small tables, and small level targets, so that a few

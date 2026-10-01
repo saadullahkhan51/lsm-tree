@@ -108,6 +108,12 @@ class MergingIterator : public Iterator {
   }
 
   // Moves the current child one step and restores the heap.
+  //
+  // ponytail: pop then push, and every comparison asks the children for
+  // their keys through a virtual call. Sifting the top down in place and
+  // caching each child's key would cut the per-entry cost of scans and
+  // compactions. Profiles show block reads and checksums dominating both,
+  // so it has not been worth it yet.
   template <typename Step>
   void AdvanceCurrent(Step step) {
     auto less = [this](const Iterator* a, const Iterator* b) { return HeapLess(a, b); };

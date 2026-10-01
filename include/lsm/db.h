@@ -62,12 +62,27 @@ class DB {
   virtual void ReleaseSnapshot(const Snapshot* snapshot) = 0;
 
   // Reports an aspect of the database's state. Returns false if the
-  // property is not recognized. Properties:
+  // property is not recognized. Counters cover the time since the database
+  // was opened. Properties:
   //
-  //   "lsm.num-files-at-level<N>"  table files in level N
-  //   "lsm.stall-micros"           total time writes spent stalled
-  //   "lsm.stall-count"            number of writes that were stalled
-  //   "lsm.levels"                 one line per non-empty level: files and bytes
+  //   "lsm.num-files-at-level<N>"   table files in level N
+  //   "lsm.levels"                  one line per non-empty level: files and bytes
+  //   "lsm.total-table-bytes"       size of all table files in the current version
+  //   "lsm.stall-micros"            total time writes spent stalled
+  //   "lsm.stall-count"             number of writes that were stalled
+  //   "lsm.user-bytes-written"      bytes of keys and values passed to Write
+  //   "lsm.wal-bytes-written"       bytes appended to write-ahead logs
+  //   "lsm.flush-bytes-written"     bytes of tables written from memtables
+  //   "lsm.compaction-bytes-written"  bytes of tables written by compaction
+  //   "lsm.compaction-bytes-read"   bytes of tables read by compaction
+  //   "lsm.write-amplification"     (wal + flush + compaction written) / user
+  //   "lsm.block-cache-hits", "lsm.block-cache-misses"
+  //   "lsm.files-probed-per-get"    histogram "0:n 1:n ... 7+:n": how many
+  //                                 table files a Get had to consult
+  //   "lsm.level-stats"             a table: per level, files, bytes, flushes
+  //                                 or compactions into it, files moved in
+  //                                 without rewriting, bytes read and written
+  //   "lsm.stats"                   all of the above, formatted for reading
   virtual bool GetProperty(const Slice& property, std::string* value) = 0;
 
   // Compacts everything in the key range [*begin, *end] down to the

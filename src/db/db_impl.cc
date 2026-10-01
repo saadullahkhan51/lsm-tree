@@ -11,6 +11,7 @@
 #include "db/compaction_check.h"
 #include "db/db_iter.h"
 #include "db/filename.h"
+#include "db/log_format.h"
 #include "db/log_reader.h"
 #include "db/memtable.h"
 #include "db/write_batch_internal.h"
@@ -311,6 +312,9 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit, Lock* lock) {
   // A file size of zero means the memtable was empty and no file exists.
   if (s.ok() && meta.file_size > 0) {
     edit->AddFile(0, meta.number, meta.file_size, meta.smallest, meta.largest);
+    flush_bytes_written_ += meta.file_size;
+    level_stats_[0].jobs++;
+    level_stats_[0].bytes_written += meta.file_size;
   }
   return s;
 }
@@ -382,6 +386,7 @@ void DBImpl::BackgroundCompaction(Lock* lock) {
     c->edit()->RemoveFile(c->level(), f->number);
     c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest, f->largest);
     status = versions_.LogAndApply(c->edit(), lock);
+    if (status.ok()) level_stats_[c->level() + 1].trivial_moves++;
   } else {
     CompactionState compact(c.get());
     status = DoCompactionWork(&compact, lock);
@@ -591,6 +596,18 @@ Status DBImpl::DoCompactionWork(CompactionState* compact, Lock* lock) {
 #endif
 
   lock->lock();
+  LevelStats& stats = level_stats_[c->level() + 1];
+  stats.jobs++;
+  for (int which = 0; which < 2; which++) {
+    for (int i = 0; i < c->num_input_files(which); i++) {
+      compaction_bytes_read_ += c->input(which, i)->file_size;
+      stats.bytes_read += c->input(which, i)->file_size;
+    }
+  }
+  for (const CompactionState::Output& out : compact->outputs) {
+    compaction_bytes_written_ += out.file_size;
+    stats.bytes_written += out.file_size;
+  }
   // A flush that failed while this compaction was running has already put
   // the database into its error state.
   if (status.ok()) status = bg_error_;
@@ -724,15 +741,17 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key, std::string* va
   // source with an entry for the key decides, whether it is a value or a
   // tombstone.
   Status s;
+  Version::GetStats stats;
   const LookupKey lookup(key, snapshot);
   if (mem->Get(lookup, value, &s)) {
     // Done.
   } else if (imm != nullptr && imm->Get(lookup, value, &s)) {
     // Done.
   } else {
-    Version::GetStats stats;
     s = current->Get(options, lookup, value, &stats);
   }
+  files_probed_[std::min(stats.files_probed, kProbeBuckets - 1)].fetch_add(
+      1, std::memory_order_relaxed);
 
   lock.lock();
   mem->Unref();
@@ -850,6 +869,12 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     }
     lock.lock();
 
+    if (status.ok()) {
+      const uint64_t payload = WriteBatchInternal::ByteSize(group);
+      // Each 32 KiB log block the record touches costs a 7-byte header.
+      wal_bytes_written_ += payload + log::kHeaderSize * (1 + payload / log::kBlockSize);
+      user_bytes_written_ += payload - WriteBatchInternal::kHeader;
+    }
     if (group == &tmp_batch_) tmp_batch_.Clear();
     if (status.ok()) {
       versions_.SetLastSequence(new_last_sequence);
@@ -894,6 +919,7 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
   }
 
   *last_writer = first;
+  if (!group_commit_enabled_) return result;
   for (auto it = std::next(writers_.begin()); it != writers_.end(); ++it) {
     Writer* w = *it;
     if (w->sync && !first->sync) {
@@ -1093,13 +1119,100 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
     *value = std::to_string(stall_count_);
     return true;
   }
-  if (property == "lsm.levels") {
+  auto levels = [&] {
+    std::string out;
     for (int level = 0; level < config::kNumLevels; level++) {
       const int files = versions_.NumLevelFiles(level);
       if (files == 0) continue;
-      *value += "level " + std::to_string(level) + ": " + std::to_string(files) + " files, " +
-                std::to_string(versions_.NumLevelBytes(level)) + " bytes\n";
+      out += "level " + std::to_string(level) + ": " + std::to_string(files) + " files, " +
+             std::to_string(versions_.NumLevelBytes(level)) + " bytes\n";
     }
+    return out;
+  };
+  auto total_table_bytes = [&] {
+    uint64_t total = 0;
+    for (int level = 0; level < config::kNumLevels; level++) total += versions_.NumLevelBytes(level);
+    return total;
+  };
+  auto write_amplification = [&] {
+    char buf[32];
+    const uint64_t written = wal_bytes_written_ + flush_bytes_written_ + compaction_bytes_written_;
+    std::snprintf(buf, sizeof(buf), "%.3f",
+                  user_bytes_written_ == 0
+                      ? 0.0
+                      : static_cast<double>(written) / static_cast<double>(user_bytes_written_));
+    return std::string(buf);
+  };
+  auto files_probed = [&] {
+    std::string out;
+    for (int n = 0; n < kProbeBuckets; n++) {
+      out += (n > 0 ? " " : "") + std::to_string(n) + (n == kProbeBuckets - 1 ? "+:" : ":") +
+             std::to_string(files_probed_[n].load(std::memory_order_relaxed));
+    }
+    return out;
+  };
+
+  const std::pair<Slice, uint64_t> counters[] = {
+      {"lsm.total-table-bytes", total_table_bytes()},
+      {"lsm.user-bytes-written", user_bytes_written_},
+      {"lsm.wal-bytes-written", wal_bytes_written_},
+      {"lsm.flush-bytes-written", flush_bytes_written_},
+      {"lsm.compaction-bytes-written", compaction_bytes_written_},
+      {"lsm.compaction-bytes-read", compaction_bytes_read_},
+      {"lsm.block-cache-hits", block_cache_.hits()},
+      {"lsm.block-cache-misses", block_cache_.misses()},
+  };
+  for (const auto& [name, counter] : counters) {
+    if (property == name) {
+      *value = std::to_string(counter);
+      return true;
+    }
+  }
+
+  if (property == "lsm.levels") {
+    *value = levels();
+    return true;
+  }
+  if (property == "lsm.write-amplification") {
+    *value = write_amplification();
+    return true;
+  }
+  if (property == "lsm.files-probed-per-get") {
+    *value = files_probed();
+    return true;
+  }
+  auto level_stats = [&] {
+    // One line per level that has seen any work:
+    //   level files bytes jobs moves read written
+    std::string out = "level  files       bytes   jobs  moves   read-bytes  written-bytes\n";
+    for (int level = 0; level < config::kNumLevels; level++) {
+      const LevelStats& ls = level_stats_[level];
+      if (versions_.NumLevelFiles(level) == 0 && ls.jobs == 0 && ls.trivial_moves == 0) continue;
+      char buf[160];
+      std::snprintf(buf, sizeof(buf), "%5d %6d %11llu %6llu %6llu %12llu %14llu\n", level,
+                    versions_.NumLevelFiles(level),
+                    static_cast<unsigned long long>(versions_.NumLevelBytes(level)),
+                    static_cast<unsigned long long>(ls.jobs),
+                    static_cast<unsigned long long>(ls.trivial_moves),
+                    static_cast<unsigned long long>(ls.bytes_read),
+                    static_cast<unsigned long long>(ls.bytes_written));
+      out += buf;
+    }
+    return out;
+  };
+  if (property == "lsm.level-stats") {
+    *value = level_stats();
+    return true;
+  }
+  if (property == "lsm.stats") {
+    *value = level_stats();
+    for (const auto& [name, counter] : counters) {
+      *value += std::string(name.substr(4)) + ": " + std::to_string(counter) + "\n";
+    }
+    *value += "write-amplification: " + write_amplification() + "\n";
+    *value += "stall-micros: " + std::to_string(stall_micros_) + "\n";
+    *value += "stall-count: " + std::to_string(stall_count_) + "\n";
+    *value += "files-probed-per-get: " + files_probed() + "\n";
     return true;
   }
   return false;
@@ -1161,6 +1274,11 @@ Status DBImpl::TEST_CheckInvariants() {
   lock.lock();
   current->Unref();
   return s;
+}
+
+void DBImpl::TEST_SetGroupCommit(bool enabled) {
+  Lock lock(mutex_);
+  group_commit_enabled_ = enabled;
 }
 
 Status DBImpl::TEST_WaitForBackgroundWork() {

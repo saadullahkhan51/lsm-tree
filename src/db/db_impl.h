@@ -52,6 +52,8 @@ class DBImpl : public DB {
   Status TEST_CompactRange(int level, const Slice* begin, const Slice* end);
   // Total size of the table files at a level.
   uint64_t TEST_NumBytesAtLevel(int level);
+  // Turns group commit off, for the benchmark that measures its effect.
+  void TEST_SetGroupCommit(bool enabled);
   // Waits until the background thread has nothing left to do: no pending
   // flush and no level over its target. Returns the background error, if
   // any.
@@ -169,6 +171,32 @@ class DBImpl : public DB {
   // many writes had to wait.
   uint64_t stall_micros_ = 0;
   uint64_t stall_count_ = 0;
+
+  // Byte counters behind the amplification properties.
+  uint64_t user_bytes_written_ = 0;
+  uint64_t wal_bytes_written_ = 0;
+  uint64_t flush_bytes_written_ = 0;
+  uint64_t compaction_bytes_written_ = 0;
+  uint64_t compaction_bytes_read_ = 0;
+
+  // What it cost to put data into each level: for level 0 the memtable
+  // flushes, for the others the compactions that wrote into them.
+  struct LevelStats {
+    uint64_t jobs = 0;           // flushes or compactions
+    uint64_t trivial_moves = 0;  // files moved in without being rewritten
+    uint64_t bytes_read = 0;     // table bytes read as compaction input
+    uint64_t bytes_written = 0;  // table bytes written
+  };
+  LevelStats level_stats_[config::kNumLevels];
+
+  // files_probed_[n]: Gets that consulted n table files; the last bucket
+  // collects n >= kProbeBuckets - 1. Updated without the mutex.
+  static constexpr int kProbeBuckets = 8;
+  std::atomic<uint64_t> files_probed_[kProbeBuckets] = {};
+
+  // False only in benchmarks that measure what group commit buys: each
+  // write is then logged and synced on its own.
+  bool group_commit_enabled_ = true;
 
   // Set when the log or the manifest can no longer be trusted. Every later
   // write fails with it and background work stops.
