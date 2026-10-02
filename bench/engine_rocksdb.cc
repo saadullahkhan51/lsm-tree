@@ -14,6 +14,21 @@ namespace {
 rocksdb::Slice ToSlice(std::string_view s) { return rocksdb::Slice(s.data(), s.size()); }
 std::string_view ToView(const rocksdb::Slice& s) { return std::string_view(s.data(), s.size()); }
 
+// RocksDB 8 (Ubuntu 24.04's) opens into a raw pointer; RocksDB 11
+// (Homebrew's) only into a unique_ptr. Use whichever this one has.
+template <typename DB>
+rocksdb::Status OpenDB(const rocksdb::Options& options, const std::string& path,
+                       std::unique_ptr<DB>* db) {
+  if constexpr (requires(DB** raw) { DB::Open(options, path, raw); }) {
+    DB* raw = nullptr;
+    rocksdb::Status s = DB::Open(options, path, &raw);
+    db->reset(raw);
+    return s;
+  } else {
+    return DB::Open(options, path, db);
+  }
+}
+
 class RocksDBCursor : public Cursor {
  public:
   explicit RocksDBCursor(rocksdb::Iterator* iter) : iter_(iter) {}
@@ -57,7 +72,7 @@ class RocksDBEngine : public Engine {
     options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
 
     read_options_.verify_checksums = config.verify_checksums;
-    rocksdb::Status s = rocksdb::DB::Open(options, config.path, &db_);
+    rocksdb::Status s = OpenDB(options, config.path, &db_);
     return s.ok() ? "" : s.ToString();
   }
 
