@@ -88,7 +88,7 @@ LookupKey::LookupKey(Slice user_key, SequenceNumber sequence) {
   start_ = dst;
   dst = EncodeVarint32(dst, static_cast<uint32_t>(usize + 8));
   kstart_ = dst;
-  std::memcpy(dst, user_key.data(), usize);
+  if (usize > 0) std::memcpy(dst, user_key.data(), usize);  // data() may be null
   dst += usize;
   EncodeFixed64(dst, PackSequenceAndType(sequence, kValueTypeForSeek));
   end_ = dst + 8;

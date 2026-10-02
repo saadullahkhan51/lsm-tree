@@ -100,7 +100,7 @@ class PosixWritableFile final : public WritableFile {
   Status Append(Slice data) override {
     // Fill the buffer; anything that does not fit goes after a flush.
     const size_t copy = std::min(data.size(), kBufferSize - pos_);
-    std::memcpy(buf_ + pos_, data.data(), copy);
+    if (copy > 0) std::memcpy(buf_ + pos_, data.data(), copy);  // data() may be null
     pos_ += copy;
     data.remove_prefix(copy);
     if (data.empty()) return Status::OK();

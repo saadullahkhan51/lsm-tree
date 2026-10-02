@@ -65,12 +65,14 @@ void MemTable::Add(SequenceNumber seq, ValueType type, Slice key, Slice value) {
                              VarintLength(value.size()) + value.size();
   char* buf = arena_.Allocate(encoded_len);
   char* p = EncodeVarint32(buf, static_cast<uint32_t>(internal_key_size));
-  std::memcpy(p, key.data(), key.size());
+  // An empty Slice may have a null data(), and memcpy from null is undefined
+  // even for zero bytes. A deletion's value is always empty.
+  if (!key.empty()) std::memcpy(p, key.data(), key.size());
   p += key.size();
   EncodeFixed64(p, PackSequenceAndType(seq, type));
   p += 8;
   p = EncodeVarint32(p, static_cast<uint32_t>(value.size()));
-  std::memcpy(p, value.data(), value.size());
+  if (!value.empty()) std::memcpy(p, value.data(), value.size());
   assert(p + value.size() == buf + encoded_len);
   table_.Insert(buf);
   num_entries_++;
