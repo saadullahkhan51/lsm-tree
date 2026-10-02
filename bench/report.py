@@ -204,7 +204,10 @@ def main(out):
         if not values:
             return "–"
         spread = f" ({fmt(min(values))}–{fmt(max(values))})" if len(values) > 1 else ""
-        return fmt(statistics.median(values)) + spread
+        # Runs that disagree by more than 2x were not measuring the same thing.
+        middle = statistics.median(values)
+        unstable = " †" if middle > 0 and (max(values) > 2 * middle or min(values) < middle / 2) else ""
+        return fmt(middle) + spread + unstable
 
     def comparison(title, suffix, benches, field="ops_per_sec", scale=1):
         md.append(f"## {title}\n")
@@ -213,7 +216,10 @@ def main(out):
                          for b in benches]))
 
     note = ("Median of the runs, with the lowest and highest in brackets. "
-            "LevelDB* is LevelDB with its default of not verifying block checksums on reads.\n")
+            "LevelDB* is LevelDB with its default of not verifying block checksums on reads. "
+            "† marks a cell whose runs disagree by more than 2×: something else was using the "
+            "machine during at least one of them, and the cell should not be used to compare "
+            "engines.\n")
     comparison("Throughput, operations per second", "", COMPARISON)
     md.append(note)
     comparison("Median latency, microseconds", "", COMPARISON, "p50_us")
@@ -261,10 +267,16 @@ def main(out):
 
     # Write amplification by level multiplier: where each rewritten byte went.
     names = ["log + flush", "into level 1", "into level 2", "into level 3", "into level 4 and deeper"]
-    panels, table_rows = [], []
+    panels, table_rows, skipped = [], [], []
     for pace, panel_title in ((0, "writing flat out"), (8000, "paced, never stalled")):
         cols = []
         for r in sorted(pick(f"wamp-pace{pace}", "settled"), key=lambda r: r["level_size_multiplier"]):
+            # A paced run whose writer stalled was not paced (the machine was
+            # suspended, say, and the writer then ran flat out to catch up).
+            if pace and any(w["stall_micros"] for w in pick(r["label"], "overwrite")
+                            if w["level_size_multiplier"] == r["level_size_multiplier"]):
+                skipped.append(str(r["level_size_multiplier"]))
+                continue
             user = r["user_bytes_written"]
             levels = [line.split() for line in r["level_stats"].split("|")[1:] if line]
             written = {int(l[0]): int(l[6]) / user for l in levels}
@@ -281,6 +293,9 @@ def main(out):
         md.append("## Write amplification by level size multiplier\n")
         md.append("Bytes written per byte of user data while overwriting a populated database.\n")
         md.append(table(["multiplier", "levels in use"] + names + ["total"], table_rows))
+        if skipped:
+            md.append(f"The paced run at multiplier {', '.join(skipped)} is left out: its writer "
+                      "stalled, so it was not paced.\n")
         column_chart(out / "write_amp.svg", "Write amplification by level size multiplier",
                      "Bytes written per user byte while overwriting a full database, split by where they went.",
                      panels, ["o1", "o2", "o3", "o4", "o5"], names, "level size multiplier",
@@ -291,11 +306,19 @@ def main(out):
     space = [r for r in rows if r["label"] == "space" and r["space_series"]]
     if space:
         live = space[0]["user_bytes"]
-        points, marks, offset = [], [], 0.0
+        points, marks, offset, suspended = [], [], 0.0, 0.0
         for i, r in enumerate(space):
             marks.append((offset, "fill" if i == 0 else f"overwrite {i}"))
-            points += [(offset + t, size / live) for t, size in r["space_series"]]
-            offset += r["seconds"]
+            previous = 0.0
+            for t, size in r["space_series"]:
+                # Samples are 0.25 s apart. A gap of seconds means the machine
+                # was suspended; that time is taken out of the axis.
+                if t - previous > 2:
+                    suspended += t - previous - 0.25
+                    offset -= t - previous - 0.25
+                points.append((offset + t, size / live))
+                previous = t
+            offset = points[-1][0]
         step, hi = nice(offset)
         line_chart(out / "space_amp.svg", "Space amplification over time",
                    "Size of the database directory over the size of the live data, while everything is overwritten three times.",
@@ -305,6 +328,9 @@ def main(out):
         md.append("## Space amplification\n")
         md.append(f"Live data: {live / 1e6:.0f} MB. Largest directory size seen: "
                   f"{max(y for _, y in points):.2f}× that; at the end: {points[-1][1]:.2f}×.\n")
+        if suspended:
+            md.append(f"The machine was suspended for {suspended:,.0f} seconds during this run; "
+                      "that time is removed from the chart.\n")
         md.append("![Space amplification](space_amp.svg)\n")
 
     # Table files consulted per Get.
@@ -321,9 +347,12 @@ def main(out):
         table_rows.append([panel_title] + [f"{s:.1f}%" for s in share])
     if panels:
         md.append("## Table files consulted per Get\n")
+        md.append("A table is consulted when its key range covers the key. Its bloom filter is "
+                  "checked first, and a data block is read only if the filter says the key may "
+                  "be there.\n")
         md.append(table(["reads of"] + [str(n) for n in range(7)] + ["7+"], table_rows))
         column_chart(out / "files_probed.svg", "Table files consulted per Get",
-                     "Share of Gets by how many table files they had to read from, after compaction has settled.",
+                     "Share of Gets by how many tables' key ranges covered the key. Each is asked; its bloom filter answers first.",
                      panels, ["s1"], ["share of Gets"], "table files consulted",
                      yfmt=lambda v: f"{v:g}%", cap=lambda v: f"{v:.0f}%" if v >= 0.5 else "")
         md.append("![Files consulted per Get](files_probed.svg)\n")
