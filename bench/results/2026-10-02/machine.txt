@@ -1,0 +1,15 @@
+date: 2026-10-01T20:44:27Z
+os: Darwin 25.5.0 arm64
+cpu: Apple M3 Pro
+cores: 11
+memory_gb: 18
+filesystem: apfs
+sync: fcntl(F_FULLFSYNC)
+page_cache: not dropped between benchmarks
+load_average_at_start: 5.13 5.99 6.94
+num: 5000000
+reads: 1000000
+runs: 3
+load_average_at_end: 9.36 5.75 5.94
+note: other programs were running throughout, and took more than a core for part of the comparison
+note: the machine was suspended on and off during the last steps. Affected: the write amplification runs at multiplier 16 and the space amplification run. Their byte counts are exact; their timings are not.
