@@ -1,0 +1,7 @@
+# Host build trees hold macOS binaries and CMake caches with host paths.
+build/
+.git/
+.cache/
+.claude/
+.DS_Store
+compile_commands.json

@@ -1,0 +1,31 @@
+# The image from the Dockerfile, with the checkout mounted so edits on the
+# host are built in the container. Each compiler keeps its build trees in
+# its own volume: the host's build/ belongs to macOS and cannot be shared.
+#
+#   docker compose run --rm gcc                      # debug build, all tests
+#   docker compose run --rm -e PRESET=tsan clang     # any preset, either compiler
+#   docker compose run --rm clang bash               # a shell
+
+x-dev: &dev
+  build: .
+  image: lsm
+
+services:
+  gcc:
+    <<: *dev
+    environment:
+      CXX: g++
+    volumes:
+      - .:/src
+      - gcc-build:/src/build
+  clang:
+    <<: *dev
+    environment:
+      CXX: clang++
+    volumes:
+      - .:/src
+      - clang-build:/src/build
+
+volumes:
+  gcc-build:
+  clang-build:

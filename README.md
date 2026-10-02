@@ -46,7 +46,7 @@ under [Measurements](#measurements).
 | 3 | **Snapshots are isolated from compaction.** | A snapshot keeps reading its value after the key is overwritten, deleted, and compacted to the bottom. A long-lived iterator survives heavy compaction and none of its files is deleted under it. [`DBTest.SnapshotSeesItsValueAfterOverwriteDeleteAndCompaction`](test/db_test.cc), [`DBCompactionTest.LongLivedIteratorSurvivesHeavyCompaction`](test/db_test.cc) |
 | 4 | **Compaction never drops a visible key.** | In debug builds every compaction's output is re-read and compared with its input at every live snapshot before it is installed; a difference aborts. Deliberately breaking the tombstone rule or the snapshot rule trips it. [`compaction_check.cc`](src/db/compaction_check.cc), [`CompactionCheck.*`](test/compaction_check_test.cc), [`DBTest.TombstoneIsKeptWhileADeeperLevelHoldsTheKey`](test/db_test.cc), [`DBCompactionTest.FullScanEquivalenceWithAModelAfterEveryStep`](test/db_test.cc) |
 | 5 | **It is measured against LevelDB and RocksDB.** | Same machine, same settings, three runs of each, medians with the range shown, and an explanation for each loss. The published run was disturbed by other work on the machine, which the results mark cell by cell. [Measurements](#measurements) below, raw data in [`bench/results/`](bench/results). |
-| 6 | **It is clean under ASan, UBSan, and TSan.** | All 296 tests pass under ASan+UBSan and under TSan. A 16-thread stress test against per-thread models ran for 600 seconds under TSan: 10.6 million operations, no reports. [`Stress.SixteenThreadsAgainstPerThreadModels`](test/stress_test.cc) |
+| 6 | **It is clean under ASan, UBSan, and TSan.** | All 296 tests pass under ASan+UBSan and under TSan, on macOS with clang 23 and on Linux with g++ 13 and clang 18 (LeakSanitizer included). A 16-thread stress test against per-thread models ran for 600 seconds under TSan: 10.6 million operations, no reports. [`Stress.SixteenThreadsAgainstPerThreadModels`](test/stress_test.cc) |
 
 What has not been verified is listed under [Limits](#limits).
 
@@ -102,6 +102,34 @@ macOS 26, and Apple clang ships no libFuzzer:
 brew install llvm
 CXX=/opt/homebrew/opt/llvm/bin/clang++ cmake --preset asan
 ```
+
+### On Linux, in Docker
+
+The image is the CI environment: Ubuntu 24.04, g++ 13, clang 18, CMake 3.28,
+plus LevelDB 1.23 and RocksDB 8.9 for `db_bench`.
+
+```sh
+docker build -t lsm . && docker run --rm lsm      # g++, debug preset, every test
+docker run --rm -e CXX=clang++ -e PRESET=asan lsm  # any compiler and preset
+
+docker compose run --rm gcc                        # the same, with the checkout mounted
+docker compose run --rm -e PRESET=tsan clang
+docker compose run --rm clang bash                 # a shell
+```
+
+`docker run` builds the copy of the source baked into the image. `docker
+compose` mounts the checkout instead, so edits on the host are picked up, and
+keeps each compiler's build trees in a volume of its own, since the host's
+`build/` holds macOS binaries.
+
+Two things the container does not give you. On Apple Silicon the image is
+arm64, so the x86 SSE4.2 checksum path is still not exercised. And under
+Docker Desktop the engine runs in a virtual machine on a virtual disk, so
+`db_bench` numbers from it describe that VM; benchmark on a Linux host.
+RocksDB is also 8.9 here and 11.8 under Homebrew, so results from the two
+are not comparable.
+
+### Long runs
 
 The long runs behind the numbers in the claims table:
 
@@ -387,11 +415,13 @@ one process per database.
 
 Not verified:
 
-- **Linux.** The engine was developed and measured on macOS. The Linux code
-  paths (`fdatasync`, the SSE4.2 checksum) have not been compiled or run:
-  the CI workflow in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
-  covers them, and it has not run because the repository has no remote yet.
-  GCC 16 with libstdc++ builds and passes all tests on macOS.
+- **Linux on x86.** The engine was developed and measured on macOS. On Linux
+  it has been built and tested only on arm64, in the Docker image above:
+  every test passes with g++ 13 and clang 18 under the debug, release,
+  ASan+UBSan, and TSan presets. The x86 SSE4.2 checksum path has never been
+  compiled. The CI workflow in
+  [`.github/workflows/ci.yml`](.github/workflows/ci.yml) covers it and has
+  not run, because the repository has no remote yet.
 - **A clean comparison run.** The published benchmark run shared the machine
   with other work, and the laptop was suspended during its last few steps.
   The results mark what that touched. It should be repeated on an idle
