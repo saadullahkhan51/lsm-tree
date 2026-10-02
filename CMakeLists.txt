@@ -105,14 +105,19 @@ if(LSM_BUILD_BENCH)
     target_link_libraries(db_bench PRIVATE ${ROCKSDB_LIBRARY})
   endif()
 
-  include(FetchContent)
-  FetchContent_Declare(benchmark
-    URL https://github.com/google/benchmark/archive/refs/tags/v1.9.4.tar.gz)
-  set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
-  set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
-  set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(benchmark)
-  add_executable(micro_bench bench/micro_bench.cc)
-  target_compile_options(micro_bench PRIVATE ${LSM_WARNINGS})
-  target_link_libraries(micro_bench PRIVATE lsm benchmark::benchmark)
+  # Microbenchmarks. Not in sanitizer builds: timings there mean nothing,
+  # and Google Benchmark 1.9.4 does not compile with the clang 23 those
+  # builds need on macOS.
+  if(NOT LSM_SANITIZE)
+    include(FetchContent)
+    FetchContent_Declare(benchmark
+      URL https://github.com/google/benchmark/archive/refs/tags/v1.9.4.tar.gz)
+    set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(benchmark)
+    add_executable(micro_bench bench/micro_bench.cc)
+    target_compile_options(micro_bench PRIVATE ${LSM_WARNINGS})
+    target_link_libraries(micro_bench PRIVATE lsm benchmark::benchmark)
+  endif()
 endif()
